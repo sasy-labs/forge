@@ -1,0 +1,748 @@
+/* Airline Agent Policy — tau2-airline
+ *
+ * English source: experiments/translation/spec.md
+ * Mode L (trace-grounded). Every structural claim in the K-block below
+ * was read off the 88 captured, oracle-labeled decision points in
+ * outputs/variant-set/run5/scenarios.json and the trace-derived system
+ * profile in outputs/variant-set/run5/system.md.
+ *
+ * Content checks are deterministic C++ functors in
+ * airline_functors.cpp. The policy uses no @llm_check_fn, no
+ * ActionMetadata and no ask-kind denials: this deployment (the tau2
+ * harness driving sasy.reference_monitor.check_tool_call) supplies an
+ * oracle for none of them and surfaces no approval prompt, so a rule
+ * resting on one would read as coverage while enforcing nothing.
+ *
+ * Round-trip audit: PASS (2026-08-20)
+ */
+#include "../../../../policies/common_policy.dl"
+
+/* ── K-Constraints (verified against the run5 traces) ───────────────
+
+   K1: Two agent names speak in every one of the 88 slices —
+       "LLMAgent" (the airline assistant under policy) and
+       "UserSimulator" (the simulated customer) — and BOTH emit
+       agent_role user, assistant and system. The capture mirrors
+       every turn under both names: across the 88 slices there are
+       exactly 326 LLMAgent/user, 326 UserSimulator/assistant and 326
+       UserSimulator/user messages, and the UserSimulator/user
+       messages carry the AGENT's words (node 36b2a5fd… is "Hi! How
+       can I help you today?"). Therefore every rule that reads "what
+       the customer said" filters BOTH msg.agent = "LLMAgent" AND
+       msg.agent_role = $UserRole(). Filtering on the role alone would
+       let the agent confirm its own database writes.
+
+   K2: A tool result is a node with agent = "LLMAgent", agent_role =
+       $AgentType() and a ToolResult(id, fn_name, args) tuple; its
+       msg.contents is the raw result payload. All eleven observed
+       tools produce result nodes except transfer_to_human_agents
+       (4 calls, 0 result nodes — system.md), so no rule joins on a
+       transfer_to_human_agents result.
+
+   K3: Every direct Edge into the Current node carries EdgeData with a
+       dense message_index covering the whole linear history (the
+       cancel_reservation-86eb603d slice has 30 such edges, indices
+       0..29, exactly one with proximal = 1). "The latest customer
+       turn" is therefore the LLMAgent/$UserRole() source holding the
+       maximal message_index on an edge into Current.
+
+   K4: get_user_details results carry membership as a bare string
+       ("regular" | "silver" | "gold") and payment_methods as an
+       OBJECT keyed by payment id — not a list. Membership is read
+       with @json_get_str and profile membership with
+       @json_object_has_key(contents, "payment_methods", pid).
+
+   K5: Reservation-shaped results (get_reservation_details,
+       book_reservation, cancel_reservation, update_reservation_*)
+       carry reservation_id, cabin, created_at ("2024-05-10T16:48:21"),
+       insurance ("yes"/"no"), total_baggages and nonfree_baggages as
+       ints, flights as an array of {flight_number, date, price} and
+       passengers as an array of {first_name, last_name, dob}. A slice
+       routinely holds several different reservations (FDZ0T5 and
+       HSR97W in one conversation), so every reservation lookup is
+       keyed on the reservation_id INSIDE the payload.
+
+   K6: update_reservation_flights, calculate, search_direct_flight and
+       search_onestop_flight results are not JSON objects (error
+       strings, bare numbers, arrays — system.md warnings). Field
+       accessors return "" on them; no rule depends on their fields.
+
+   K7: Failed calls also produce result nodes ("Error: User
+       user_current not found"). Reservation state for the reservation
+       being acted on may therefore be absent, so every rule that
+       consults reservation state is guarded on that state existing.
+       A rule that denied on absence would deny every first touch.
+
+   K8: Slices run 7–84 nodes with at most 2 agent names. The read and
+       arithmetic tools (get_reservation_details, search_direct_flight,
+       search_onestop_flight, calculate — 50 of the 88 decision
+       points) need no graph state at all, so
+       CurrentDependsPolicyRelevant is gated to the tools that do.
+
+   K9: Captured decision points carry principal "captured-principal"
+       and NO roles (provenance.roles_unknown: true on all 88). No
+       airline rule may gate on HasRole — every live call would fail.
+   ────────────────────────────────────────────────────────────────── */
+
+/* ── Structured Spec ────────────────────────────────────────────────
+
+   C1  Allow the airline agent's own tool set; deny anything else.
+   C2  Deny get_user_details when the user id was never supplied by
+       the customer nor returned by an earlier tool call.
+   C3  Deny a booking-database write (book, cancel, change flights,
+       change baggage, change passengers) unless the latest customer
+       turn is an explicit go-ahead.
+   C4  A go-ahead conditioned on a figure the agent has not yet
+       supplied ("tell me the charge before you finalize") is not an
+       explicit go-ahead.
+   C5  Deny book_reservation with more than five passengers.
+   C6  Deny book_reservation whose passenger dates of birth never
+       appeared in the conversation.
+   C7  Deny book_reservation using more than one travel certificate,
+       more than one credit card, or more than three gift cards — and
+       therefore more than five payment methods in total, since those
+       are the only three kinds of payment method there are.
+   C8  Deny a write whose payment method is not in the customer's
+       profile.
+   C9  Deny update_reservation_flights that changes the itinerary of a
+       basic-economy reservation.
+   C10 Deny a reservation update paid with a travel certificate.
+   C11 Deny update_reservation_passengers that changes the number of
+       passengers.
+   C12 Deny update_reservation_baggages that lowers the number of
+       checked bags.
+   C13 Deny cancel_reservation until the customer has given a reason
+       for cancelling.
+   C14 Deny cancel_reservation unless the reservation qualifies:
+       booked within the last 24 hours, business cabin, or covered by
+       travel insurance.
+   C15 Deny cancel_reservation, and deny a cabin change, once any
+       flight in the reservation has departed.
+   C16 Deny send_certificate to a regular member, or before the
+       membership level has been verified.
+   C17 Deny send_certificate the customer did not ask for.
+
+   Graph assumptions per clause, with trace evidence:
+     C2, C6      read every customer turn and every tool result in the
+                 backward slice (K1, K2).
+     C3, C4      read exactly the latest customer turn, located by
+                 message_index on the edges into Current (K3).
+     C8, C16     read get_user_details payloads (K4).
+     C9, C11,
+     C12, C14,
+     C15         read reservation payloads keyed by the payload's own
+                 reservation_id (K5), guarded on presence (K7).
+     C13, C17    read every customer turn in the slice (K1).
+
+   Deliberately not encoded, and why:
+     · "cannot change origin, destination or trip type" —
+       update_reservation_flights arguments carry only flight_number
+       and date (system.md argument fields), so the route a proposed
+       itinerary implies is not visible at the decision point.
+     · "cannot add insurance after booking" — no update tool takes an
+       insurance argument, so the action is unreachable.
+     · "one tool call at a time", "no unsupported information or
+        subjective recommendations", "transfer only when out of
+       scope" — these constrain the agent's prose, which the tool-call
+       decision point does not carry.
+     · C14's airline-cancellation branch — whether the airline
+       cancelled a flight lives in get_flight_status output, which no
+       captured slice contains; the branch is folded into the
+       insurance and 24-hour branches rather than guessed at.
+
+   Known limits of what is encoded:
+     · C8 only fires once the customer's profile is in the slice. An
+       agent that pays without ever calling get_user_details is not
+       stopped by it — the alternative, denying every payment until a
+       profile has been read, would deny first-touch bookings the
+       captured traffic makes routinely.
+     · Reservation state is whatever any payload in the slice shows,
+       not the newest payload. Bag counts and passenger counts only
+       move in the direction the policy already allows, and
+       cancellation eligibility takes any qualifying payload, so the
+       looseness is one-directional. C9 is the exception and reads
+       the newest cabin explicitly.
+     · C6 checks the first five passengers and C8 the first five
+       payment methods. C5 and C7 deny anything longer, so no
+       element escapes both.
+   ────────────────────────────────────────────────────────────────── */
+
+/* ── Custom content functors (airline_functors.cpp) ─────────────── */
+
+.functor user_confirms(text: symbol): unsigned stateful
+.functor confirmation_deferred(text: symbol): unsigned stateful
+.functor payment_last_four(profile: symbol, pid: symbol): symbol stateful
+.functor cancel_reason(text: symbol): unsigned stateful
+.functor compensation_requested(text: symbol): unsigned stateful
+.functor contains_ci(hay: symbol, needle: symbol): unsigned stateful
+.functor flights_differ(args: symbol, payload: symbol): unsigned stateful
+.functor any_flight_departed(payload: symbol, today: symbol): unsigned stateful
+.functor count_payment_prefix(args: symbol, prefix: symbol): unsigned stateful
+
+/* ── Tool taxonomy (C1) ─────────────────────────────────────────── */
+
+/* C1: the tools this agent is allowed to call at all. */
+.decl AirlineTool(name: symbol)
+AirlineTool("get_user_details").
+AirlineTool("get_reservation_details").
+AirlineTool("get_flight_status").
+AirlineTool("search_direct_flight").
+AirlineTool("search_onestop_flight").
+AirlineTool("calculate").
+AirlineTool("think").
+AirlineTool("book_reservation").
+AirlineTool("cancel_reservation").
+AirlineTool("update_reservation_flights").
+AirlineTool("update_reservation_passengers").
+AirlineTool("update_reservation_baggages").
+AirlineTool("send_certificate").
+AirlineTool("transfer_to_human_agents").
+
+/* C3: the writes that change the booking database. */
+.decl DbWriteTool(name: symbol)
+DbWriteTool("book_reservation").
+DbWriteTool("cancel_reservation").
+DbWriteTool("update_reservation_flights").
+DbWriteTool("update_reservation_passengers").
+DbWriteTool("update_reservation_baggages").
+
+/* C8, C10: the updates that take a single payment_id argument. */
+.decl UpdatePayTool(name: symbol)
+UpdatePayTool("update_reservation_flights").
+UpdatePayTool("update_reservation_baggages").
+
+/* K5: the tools whose results carry a full reservation payload.
+   update_reservation_flights is absent by K6 — its result is an
+   error string or a bare confirmation, never a JSON object. */
+.decl ResPayloadTool(name: symbol)
+ResPayloadTool("get_reservation_details").
+ResPayloadTool("book_reservation").
+ResPayloadTool("cancel_reservation").
+ResPayloadTool("update_reservation_passengers").
+ResPayloadTool("update_reservation_baggages").
+
+/* K8: only these actions consult prior graph state. Gating the
+   traversal here keeps the 50 read/arithmetic decision points from
+   walking their slice at all. */
+.decl NeedsGraphState(name: symbol)
+NeedsGraphState(n) :- DbWriteTool(n).
+NeedsGraphState("get_user_details").
+NeedsGraphState("send_certificate").
+
+CurrentDependsPolicyRelevant() :-
+    Actions(_, a),
+    IsTool(a, name),
+    NeedsGraphState(name).
+
+/* Small bounded index sets for walking JSON arrays. Five is the
+   passenger ceiling the policy itself sets (C5); a booking with more
+   passengers than that is denied by C5 regardless. */
+.decl PassengerIdx(i: unsigned)
+PassengerIdx(0). PassengerIdx(1). PassengerIdx(2).
+PassengerIdx(3). PassengerIdx(4).
+
+.decl PaymentIdx(i: unsigned)
+PaymentIdx(0). PaymentIdx(1). PaymentIdx(2).
+PaymentIdx(3). PaymentIdx(4).
+
+/* ── Conversation view ──────────────────────────────────────────── */
+
+/* K1: a turn the CUSTOMER wrote. The msg.agent filter is what keeps
+   the mirrored UserSimulator/$UserRole() turns — which carry the
+   agent's own words — out of every content rule below. */
+.decl CustomerTurn(id: symbol)
+CustomerTurn(id) :-
+    CurrentDepends(id),
+    SentMessage(id, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $UserRole().
+
+/* K3: customer turns positioned in the linear history of the action
+   under evaluation. */
+.decl CustomerTurnAt(mi: number, id: symbol)
+CustomerTurnAt(mi, src) :-
+    Current(dst),
+    EdgeData(src, dst, ed),
+    mi = ed.message_index,
+    mi >= 0,
+    SentMessage(src, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $UserRole().
+
+.decl SupersededCustomerTurn(mi: number)
+SupersededCustomerTurn(m1) :-
+    CustomerTurnAt(m1, _),
+    CustomerTurnAt(m2, _),
+    m2 > m1.
+
+.decl LatestCustomerTurn(id: symbol)
+LatestCustomerTurn(id) :-
+    CustomerTurnAt(mi, id),
+    !SupersededCustomerTurn(mi).
+
+.decl LatestCustomerText(text: symbol)
+LatestCustomerText(text) :-
+    LatestCustomerTurn(id),
+    SentMessage(id, msg),
+    text = msg.contents.
+
+/* C3: a general go-ahead in the latest customer turn confirms
+   whatever the agent listed. C4 is folded into @user_confirms: a turn
+   that defers on a figure the agent still owes is not a go-ahead. */
+.decl GeneralGoAhead()
+GeneralGoAhead() :-
+    LatestCustomerText(text),
+    @user_confirms(text) = 1.
+
+/* C4: the same deferral, isolated so it also vetoes the
+   payment-instrument route below. */
+.decl GoAheadDeferred()
+GoAheadDeferred() :-
+    LatestCustomerText(text),
+    @confirmation_deferred(text) = 1.
+
+/* K1, K2: text the agent may treat as established fact — what the
+   customer wrote, and what the tools returned. The agent's own prose
+   is deliberately excluded: a detail the agent invented and then
+   restated does not become grounded by being restated. */
+.decl GroundingText(text: symbol)
+GroundingText(text) :-
+    CustomerTurn(id),
+    SentMessage(id, msg),
+    text = msg.contents.
+GroundingText(text) :-
+    CurrentDepends(id),
+    ToolResult(id, _, _),
+    SentMessage(id, msg),
+    text = msg.contents.
+
+/* ── Reservation and profile state (K5, K7) ─────────────────────── */
+
+.decl ResPayload(rid: symbol, payload: symbol)
+ResPayload(rid, payload) :-
+    CurrentDepends(id),
+    ToolResult(id, tool, _),
+    ResPayloadTool(tool),
+    SentMessage(id, msg),
+    payload = msg.contents,
+    rid = @json_get_str(payload, "reservation_id"),
+    rid != "".
+
+/* K7: guard predicate — is anything known about this reservation? */
+.decl ResKnown(rid: symbol)
+ResKnown(rid) :- ResPayload(rid, _).
+
+.decl ResCabin(rid: symbol, cabin: symbol)
+ResCabin(rid, cabin) :-
+    ResPayload(rid, payload),
+    cabin = @json_get_str(payload, "cabin"),
+    cabin != "".
+
+.decl ResCreatedAt(rid: symbol, ts: symbol)
+ResCreatedAt(rid, ts) :-
+    ResPayload(rid, payload),
+    ts = @json_get_str(payload, "created_at"),
+    ts != "".
+
+.decl ResInsurance(rid: symbol, ins: symbol)
+ResInsurance(rid, ins) :-
+    ResPayload(rid, payload),
+    ins = @json_get_str(payload, "insurance"),
+    ins != "".
+
+.decl ResTotalBaggages(rid: symbol, bags: number)
+ResTotalBaggages(rid, bags) :-
+    ResPayload(rid, payload),
+    @json_has_field(payload, "total_baggages") = 1,
+    bags = @json_get_int(payload, "total_baggages").
+
+.decl ResPassengerCount(rid: symbol, n: unsigned)
+ResPassengerCount(rid, n) :-
+    ResPayload(rid, payload),
+    n = @json_array_len(payload, "passengers"),
+    n > 0.
+
+/* K4: payment instruments on the customer's profile. Reservation
+   payment history counts too — an instrument the reservation was
+   already charged to is on file by construction. */
+.decl ProfilePayload(payload: symbol)
+ProfilePayload(payload) :-
+    CurrentDepends(id),
+    ToolResult(id, "get_user_details", _),
+    SentMessage(id, msg),
+    payload = msg.contents,
+    @json_has_field(payload, "payment_methods") = 1.
+
+.decl ProfileKnown()
+ProfileKnown() :- ProfilePayload(_).
+
+.decl CandidatePayment(idx: unsigned, pid: symbol)
+CandidatePayment(idx, pid) :-
+    Actions(idx, a),
+    a = $CallTool(fn, args),
+    UpdatePayTool(fn),
+    pid = @json_get_str(args, "payment_id"),
+    pid != "".
+CandidatePayment(idx, pid) :-
+    Actions(idx, a),
+    IsTool(a, "book_reservation"),
+    a = $CallTool(_, args),
+    PaymentIdx(i),
+    n = @json_array_len(args, "payment_methods"),
+    i < n,
+    pid = @json_array_get_field_str(args, "payment_methods", i, "payment_id"),
+    pid != "".
+
+.decl ProfilePayment(pid: symbol)
+ProfilePayment(pid) :-
+    CandidatePayment(_, pid),
+    CurrentDepends(id),
+    ToolResult(id, "get_user_details", _),
+    SentMessage(id, msg),
+    @json_object_has_key(msg.contents, "payment_methods", pid) = 1.
+ProfilePayment(pid) :-
+    CandidatePayment(_, pid),
+    ResPayload(_, payload),
+    @str_contains(payload, pid) = 1.
+
+/* C3: the second route to confirmation. When the customer names the
+   instrument to charge — by its id, or by the last four digits the
+   profile records for it ("you can use my credit card ending in
+   3848") — that authorizes the action that charges THAT instrument,
+   and only that one. Charging a different instrument still needs its
+   own go-ahead. */
+.decl PaymentNamedByCustomer(idx: unsigned, pid: symbol)
+PaymentNamedByCustomer(idx, pid) :-
+    CandidatePayment(idx, pid),
+    LatestCustomerText(text),
+    @contains_ci(text, pid) = 1.
+PaymentNamedByCustomer(idx, pid) :-
+    CandidatePayment(idx, pid),
+    LatestCustomerText(text),
+    ProfilePayload(payload),
+    digits = @payment_last_four(payload, pid),
+    digits != "",
+    @str_contains(text, digits) = 1.
+
+.decl PaymentUnnamed(idx: unsigned)
+PaymentUnnamed(idx) :-
+    CandidatePayment(idx, pid),
+    !PaymentNamedByCustomer(idx, pid).
+
+/* C3, C4: the action carries the customer's go-ahead, by either
+   route. C4's deferral vetoes both. */
+.decl ConfirmedForAction(idx: unsigned)
+ConfirmedForAction(idx) :-
+    Actions(idx, _),
+    GeneralGoAhead().
+ConfirmedForAction(idx) :-
+    CandidatePayment(idx, _),
+    !PaymentUnnamed(idx),
+    !GoAheadDeferred().
+
+/* K4: membership level, keyed on the profile's own user_id so two
+   customers in one slice never mix. */
+.decl UserMembership(uid: symbol, level: symbol)
+UserMembership(uid, level) :-
+    CurrentDepends(id),
+    ToolResult(id, "get_user_details", _),
+    SentMessage(id, msg),
+    uid = @json_get_str(msg.contents, "user_id"),
+    uid != "",
+    level = @json_get_str(msg.contents, "membership"),
+    level != "".
+
+.decl MembershipKnown(uid: symbol)
+MembershipKnown(uid) :- UserMembership(uid, _).
+
+/* ── C1: allowlist ──────────────────────────────────────────────── */
+
+/* C1: the agent's own tools are authorized; every denial below carves
+   out of this one rule. Anything not on the list has no allow rule
+   and is refused by default. */
+IsAuthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, name),
+    AirlineTool(name).
+
+/* C1: replying to the customer is not a database action and carries
+   no argument the policy can check; message sends pass through. */
+IsAuthorized(idx) :-
+    Actions(idx, a),
+    a = $SendAttempt(_).
+
+DenyUnauthorized(idx) :- Actions(idx, _).
+
+/* ── C2: the user id must come from the customer ────────────────── */
+
+.decl RequestedUserId(idx: unsigned, uid: symbol)
+RequestedUserId(idx, uid) :-
+    Actions(idx, a),
+    IsTool(a, "get_user_details"),
+    a = $CallTool(_, args),
+    uid = @json_get_str(args, "user_id"),
+    uid != "".
+
+.decl UserIdGrounded(uid: symbol)
+UserIdGrounded(uid) :-
+    RequestedUserId(_, uid),
+    GroundingText(text),
+    @contains_ci(text, uid) = 1.
+
+// @deny_message: The user id was never provided by the customer or returned by an earlier tool call, so it cannot be looked up.
+// @suggestion: Ask the customer for their user id, or locate their profile from a reservation id they give you, before calling get_user_details.
+Unauthorized(idx) :-
+    RequestedUserId(idx, uid),
+    !UserIdGrounded(uid).
+
+/* ── C3, C4: explicit confirmation before any database write ────── */
+
+// @deny_message: This action changes the booking database and the customer has not given an explicit go-ahead for it.
+// @suggestion: List the exact action details — flights, cabin, passengers, bags, payment method and amount — answer any figure the customer asked for first, then ask them to confirm with 'yes' and call the tool only after they do.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, name),
+    DbWriteTool(name),
+    !ConfirmedForAction(idx).
+
+/* ── C5, C6, C7, C8: booking a reservation ──────────────────────── */
+
+// @deny_message: A reservation can carry at most five passengers.
+// @suggestion: Split the party across several reservations of at most five passengers each.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "book_reservation"),
+    a = $CallTool(_, args),
+    n = @json_array_len(args, "passengers"),
+    n > 5.
+
+.decl BookedPassengerDob(idx: unsigned, dob: symbol)
+BookedPassengerDob(idx, dob) :-
+    Actions(idx, a),
+    IsTool(a, "book_reservation"),
+    a = $CallTool(_, args),
+    PassengerIdx(i),
+    n = @json_array_len(args, "passengers"),
+    i < n,
+    dob = @json_array_get_field_str(args, "passengers", i, "dob"),
+    dob != "".
+
+.decl DobGrounded(dob: symbol)
+DobGrounded(dob) :-
+    BookedPassengerDob(_, dob),
+    GroundingText(text),
+    @str_contains(text, dob) = 1.
+
+// @deny_message: A passenger's date of birth on this booking never appeared in the conversation, so it was not collected from the customer.
+// @suggestion: Ask the customer for the first name, last name and date of birth of every passenger, and book only the details they give you.
+Unauthorized(idx) :-
+    BookedPassengerDob(idx, dob),
+    !DobGrounded(dob).
+
+// @deny_message: A reservation may use at most one travel certificate.
+// @suggestion: Use a single certificate on this reservation and cover the rest with gift cards or a credit card, or split the party into separate reservations.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "book_reservation"),
+    a = $CallTool(_, args),
+    n = @count_payment_prefix(args, "certificate"),
+    n > 1.
+
+// @deny_message: A reservation may use at most one credit card.
+// @suggestion: Choose one credit card for this reservation.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "book_reservation"),
+    a = $CallTool(_, args),
+    n = @count_payment_prefix(args, "credit_card"),
+    n > 1.
+
+// @deny_message: A reservation may use at most three gift cards.
+// @suggestion: Use at most three gift cards and cover any remainder with a credit card or a travel certificate.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "book_reservation"),
+    a = $CallTool(_, args),
+    n = @count_payment_prefix(args, "gift_card"),
+    n > 3.
+
+// @deny_message: A reservation may use at most five payment methods — one travel certificate, one credit card and three gift cards.
+// @suggestion: Reduce the booking to at most one certificate, one credit card and three gift cards, or split the party into separate reservations.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "book_reservation"),
+    a = $CallTool(_, args),
+    n = @json_array_len(args, "payment_methods"),
+    n > 5.
+
+// @deny_message: That payment method is not on the customer's profile, and only stored payment methods may be used.
+// @suggestion: Read the customer's profile with get_user_details and pay with one of the payment methods listed there.
+Unauthorized(idx) :-
+    CandidatePayment(idx, pid),
+    ProfileKnown(),
+    !ProfilePayment(pid).
+
+/* ── C9, C10: changing flights and cabin ────────────────────────── */
+
+/* K7: a reservation the conversation has also shown in some other
+   cabin is not a basic-economy reservation any more — an earlier
+   payload from before an upgrade must not bar a later flight change.
+   update_reservation_flights results are not JSON (K6), so the newer
+   cabin only appears once the agent re-reads the reservation. */
+.decl ResCabinOtherThanBasic(rid: symbol)
+ResCabinOtherThanBasic(rid) :-
+    ResCabin(rid, cabin),
+    cabin != "basic_economy".
+
+
+// @deny_message: Basic economy flights cannot be changed.
+// @suggestion: Explain that a basic economy itinerary cannot be modified. The cabin alone can still be changed, and the reservation can be cancelled if it qualifies.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "update_reservation_flights"),
+    a = $CallTool(_, args),
+    rid = @json_get_str(args, "reservation_id"),
+    rid != "",
+    ResCabin(rid, "basic_economy"),
+    !ResCabinOtherThanBasic(rid),
+    ResPayload(rid, payload),
+    @flights_differ(args, payload) = 1.
+
+// @deny_message: A reservation update must be paid with a single gift card or credit card; a travel certificate cannot be used.
+// @suggestion: Ask the customer for a gift card or credit card on their profile and pay the difference with that.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    a = $CallTool(fn, args),
+    UpdatePayTool(fn),
+    pid = @json_get_str(args, "payment_id"),
+    @str_starts_with(pid, "certificate") = 1.
+
+/* ── C11: the number of passengers is fixed ─────────────────────── */
+
+// @deny_message: The number of passengers on a reservation cannot be changed — not by this agent and not by a human agent.
+// @suggestion: Passenger details can be corrected as long as the count stays the same. To travel with a different number of people the reservation must be cancelled, if it qualifies, and rebooked.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "update_reservation_passengers"),
+    a = $CallTool(_, args),
+    rid = @json_get_str(args, "reservation_id"),
+    rid != "",
+    ResPassengerCount(rid, was),
+    now = @json_array_len(args, "passengers"),
+    now != was.
+
+/* ── C12: checked bags can be added, not removed ────────────────── */
+
+// @deny_message: Checked bags can be added to a reservation but not removed.
+// @suggestion: Explain that bags already on the reservation cannot be taken off and are not refundable; only additional bags can be booked.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "update_reservation_baggages"),
+    a = $CallTool(_, args),
+    rid = @json_get_str(args, "reservation_id"),
+    rid != "",
+    ResTotalBaggages(rid, was),
+    now = @json_get_int(args, "total_baggages"),
+    now < was.
+
+/* ── C13, C14, C15: cancelling ──────────────────────────────────── */
+
+.decl CancelTarget(idx: unsigned, rid: symbol)
+CancelTarget(idx, rid) :-
+    Actions(idx, a),
+    IsTool(a, "cancel_reservation"),
+    a = $CallTool(_, args),
+    rid = @json_get_str(args, "reservation_id"),
+    rid != "".
+
+.decl CancellationReasonGiven()
+CancellationReasonGiven() :-
+    CustomerTurn(id),
+    SentMessage(id, msg),
+    @cancel_reason(msg.contents) = 1.
+
+// @deny_message: The customer has not given a reason for cancelling, and the reason decides whether the cancellation is allowed.
+// @suggestion: Ask whether this is a change of plan, a flight the airline cancelled, or another reason, and record the answer before cancelling.
+Unauthorized(idx) :-
+    CancelTarget(idx, _),
+    !CancellationReasonGiven().
+
+/* C14: the reservation qualifies for cancellation. The spec's
+   airline-cancellation branch is not represented — see the spec block
+   above. hours_between returns an absolute difference, so the >= 0
+   guard only rejects its -1 parse failure. */
+.decl CancelEligible(rid: symbol)
+CancelEligible(rid) :-
+    ResCreatedAt(rid, ts),
+    h = @hours_between(ts, "2024-05-15T15:00:00"),
+    h >= 0,
+    h < 24.
+CancelEligible(rid) :- ResCabin(rid, "business").
+CancelEligible(rid) :- ResInsurance(rid, "yes").
+
+// @deny_message: This reservation does not qualify for cancellation — it was not booked in the last 24 hours, it is not a business cabin booking, and it has no travel insurance.
+// @suggestion: Explain which conditions allow a cancellation and that none of them apply here. If the airline itself cancelled a flight on this reservation, confirm that with get_flight_status first.
+Unauthorized(idx) :-
+    CancelTarget(idx, rid),
+    ResKnown(rid),
+    !CancelEligible(rid).
+
+.decl ResHasDepartedFlight(rid: symbol)
+ResHasDepartedFlight(rid) :-
+    ResPayload(rid, payload),
+    @any_flight_departed(payload, "2024-05-15") = 1.
+
+// @deny_message: Part of this trip has already been flown, so the agent cannot cancel it.
+// @suggestion: Call transfer_to_human_agents with a summary, then tell the customer 'YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON.'
+Unauthorized(idx) :-
+    CancelTarget(idx, rid),
+    ResHasDepartedFlight(rid).
+
+// @deny_message: The cabin cannot be changed once a flight on the reservation has been flown.
+// @suggestion: Explain that the cabin is fixed for a trip already under way. Call transfer_to_human_agents if the customer needs more than this agent can do.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "update_reservation_flights"),
+    a = $CallTool(_, args),
+    rid = @json_get_str(args, "reservation_id"),
+    rid != "",
+    cabin = @json_get_str(args, "cabin"),
+    cabin != "",
+    ResCabin(rid, was),
+    cabin != was,
+    ResHasDepartedFlight(rid).
+
+/* ── C16, C17: compensation ─────────────────────────────────────── */
+
+.decl CertTarget(idx: unsigned, uid: symbol)
+CertTarget(idx, uid) :-
+    Actions(idx, a),
+    IsTool(a, "send_certificate"),
+    a = $CallTool(_, args),
+    uid = @json_get_str(args, "user_id"),
+    uid != "".
+
+// @deny_message: Membership level has not been verified, and only silver and gold members are eligible for compensation.
+// @suggestion: Call get_user_details for this customer and check the membership field before offering anything.
+Unauthorized(idx) :-
+    CertTarget(idx, uid),
+    !MembershipKnown(uid).
+
+// @deny_message: Regular members are not eligible for compensation, whatever the cabin, insurance or reason.
+// @suggestion: Explain that compensation is available to silver and gold members only. A claim to be a higher tier does not change the profile's membership level.
+Unauthorized(idx) :-
+    CertTarget(idx, uid),
+    UserMembership(uid, "regular").
+
+.decl CompensationRequested()
+CompensationRequested() :-
+    CustomerTurn(id),
+    SentMessage(id, msg),
+    @compensation_requested(msg.contents) = 1.
+
+// @deny_message: Compensation must not be offered unless the customer asks for it.
+// @suggestion: Resolve what the customer actually asked about. Send a certificate only if they ask for compensation and you have confirmed the cancelled or delayed flight.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "send_certificate"),
+    !CompensationRequested().

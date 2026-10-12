@@ -1,0 +1,610 @@
+/* Allow-all capture policy.
+
+   Authorizes every action and never denies. Used by the
+   translation loop to record natural (unblocked) agent traces:
+   pin it per session via SASY_POLICY_PATH (or
+   sasy.session(policy=...)) with SASY_CAPTURE_FILE set, then
+   convert the captured decision points into test scenarios with
+   scripts/translation/capture_to_scenarios.py.
+
+   NOT for production use. */
+/*
+    Common Policy Code (Souffle)
+
+    Users should define logic for when IsAuthorized(idx) and Unauthorized(idx)
+    should hold. Unauthorized always overrides, but any approved request requires
+    BOTH explicit authorization via IsAuthorized and no denial from Unauthorized.
+
+    For Unauthorized rules, prefer writing
+    DenialReason(idx, kind, reason, suggestion) instead — common_policy derives
+    Unauthorized(idx) from a "block"-kind DenialReason automatically.
+    Annotated Unauthorized rules are rewritten to DenialReason by sugar.py.
+
+    Each index idx maps to an Action as defined below. Utilities and common
+    relations are provided for dependencies between messages, requesting
+    entity and role(s), the ID of the messages, if any, which directly produced
+    the action request, and for messages contents and metadata.
+*/
+
+/* ── Type Definitions ─────────────────────────────────────────────── */
+
+.type AgentRole = Assistant {} | SystemRole {} | UserRole {} | AgentType {}
+
+// Message record. Field semantics:
+//   contents     — message text
+//   tools_json   — JSON-encoded list of tool calls on this message
+//   agent        — conversation role label (free-form, e.g. "agent-a")
+//   agent_role   — role within the conversation (Assistant/User/...)
+//   entity       — user-supplied actor in the caller's domain
+//                  (free-form, unvalidated; empty = unset)
+//   principal    — server-stamped auth-derived identity of the gRPC
+//                  caller that wrote this message (immutable; empty
+//                  = anonymous). Use this for accountability rules;
+//                  prefer `entity` for caller-domain actor matching.
+.type Message = [
+    contents: symbol,
+    tools_json: symbol,
+    agent: symbol,
+    agent_role: AgentRole,
+    entity: symbol,
+    principal: symbol
+]
+
+.type Action = SendAttempt { message: Message }
+             | CallTool { fn_name: symbol, args: symbol }
+             | HTTPRequest { url: symbol, body: symbol, headers_json: symbol }
+
+/* ── Input Relations ──────────────────────────────────────────────── */
+
+// Edges of the dependency graph
+// Edge(source, dest) means "dest depends on source"
+.decl Edge(source_id: symbol, dest_id: symbol)
+.input Edge(rfc4180=true)
+
+// Edge metadata, emitted alongside Edge when the source was
+// recorded with instrumentation context. Not every Edge has an
+// EdgeData tuple — the graph contains Edges with no metadata
+// (e.g. edges recorded without instrumentation context). A tuple is emitted when
+// at least one field is set; unset fields carry -1.
+//
+// Fields:
+//   proximal (-1 = unset, 0 = false, 1 = true) — 1 when the
+//     source was the immediate predecessor of the destination
+//     in the recording step's input history (i.e. the last
+//     input before the output). Useful for disambiguating "the
+//     message the user was directly responding to" from
+//     earlier messages in the same batch.
+//   message_index (-1 = unset, >= 0 = position) — 0-indexed
+//     position of the source in the destination's input
+//     history. Edges recorded without an ordered history
+//     leave this at -1.
+.type EdgeDataRecord = [
+    proximal: number,
+    message_index: number
+]
+.decl EdgeData(source_id: symbol, dest_id: symbol, data: EdgeDataRecord)
+.input EdgeData(rfc4180=true)
+
+// Who asserted the edge. Server-stamped from the caller's
+// authentication when the edge was recorded; absent when the
+// recording client sent no auth-derived identity. A tuple exists
+// only when the value is present — an edge whose principal is
+// unknown simply has no row here.
+.decl EdgePrincipal(source_id: symbol, dest_id: symbol, principal: symbol)
+.input EdgePrincipal(rfc4180=true)
+
+// The free-form actor the recording client named for the edge.
+// Client-supplied and stored as sent: it is never auth-attested and
+// nothing rewrites it on the way in. Absent when not sent — as with
+// EdgePrincipal, a tuple exists only when the value is present.
+.decl EdgeEntity(source_id: symbol, dest_id: symbol, entity: symbol)
+.input EdgeEntity(rfc4180=true)
+
+// Maps from message IDs to details
+.decl SentMessage(id: symbol, message: Message)
+.input SentMessage(rfc4180=true)
+
+// The message is the return value of calling a tool
+.decl ToolResult(id: symbol, fn_name: symbol, args: symbol)
+.input ToolResult(rfc4180=true)
+
+// The adapter-defined canonical record of the source message
+// (`Event.metadata`), keyed by message id. A message recorded without
+// one has no row here, so a rule that joins on it never matches such a
+// message. The server stores and returns the string as sent and never
+// interprets it.
+//
+// The supplied adapters write canonical JSON, in which every object key
+// carries a short type prefix — the string key `content` is written
+// `s:content`. Read it with the `@json_*` functors:
+//     @json_get_str(md, "s:content")
+//     @json_get_str_path(md, "s:additional_kwargs.s:marker")
+// A path is split on `.` and `[` only, so the colon in a prefixed key is
+// ordinary text and needs no escaping. A key that itself contains a `.`
+// or a `[` cannot be reached by a path; at the top level
+// `@json_get_str` takes the whole key and reads it.
+.decl MessageMetadata(id: symbol, metadata: symbol)
+.input MessageMetadata(rfc4180=true)
+
+// The IDs of the recorded messages that triggered the action, as sent in
+// `input_node_ids` on the authorization request.
+.decl Current(id: symbol)
+.input Current(rfc4180=true)
+
+// The actions that the current request comprises
+.decl Actions(idx: unsigned, action: Action)
+.input Actions(rfc4180=true)
+
+// Per-action metadata: facts the caller resolved outside the engine for a
+// specific action at check time (e.g. a package-registry verdict for an
+// install command), supplied on `Action.metadata` and projected here, indexed by the
+// same `idx` as `Actions`. A generic `(idx, rel, a, b)` tuple; the policy
+// projects it into typed relations it declares itself, e.g.
+//   PackageVerdict(p, v) :- ActionMetadata(_, "pkg_verdict", p, v).
+// Per-request and scoped to the action under evaluation — distinct from
+// `PolicyMetadata` (static, per-policy config seeded once at init).
+.decl ActionMetadata(idx: unsigned, rel: symbol, a: symbol, b: symbol)
+.input ActionMetadata(rfc4180=true)
+
+// Server-stamped principal of the request — the immutable
+// auth-derived identity of the gRPC caller. Populated from the
+// authentication chain (mTLS subject / JWT sub / API key →
+// auth_config.yaml mapping). Cannot be forged from the wire.
+// Use this for accountability/audit rules.
+.decl Principal(id: symbol)
+.input Principal(rfc4180=true)
+
+// User-supplied per-request actor. Free-form value the caller
+// attaches to a request (e.g. an end-user identity when a
+// gateway relays on someone's behalf). NOT auth-attested — a
+// caller can send any string here, so do not gate authorization
+// on `Entity` alone; combine with `Principal`/`HasRole` checks
+// when accountability matters.
+.decl Entity(id: symbol)
+.input Entity(rfc4180=true)
+
+// Roles associated with the authenticated principal (from auth
+// config / JWT claims). The first column is the principal id;
+// each tuple binds one role to that principal.
+.decl PrincipalRole(principal: symbol, role: symbol)
+.input PrincipalRole(rfc4180=true)
+
+// Tenant identifier for multi-tenant policy rules. Server-derived
+// from auth (never wire-supplied) and combined with the request's
+// session_id into the storage shard key.
+.decl TenantId(id: symbol)
+.input TenantId(rfc4180=true)
+
+// Static policy configuration, supplied as metadata on the policy upload
+// (`SetPolicyRequest.policy_metadata`) and materialized as EDB facts when the
+// per-session evaluator initializes. A generic `(rel, a, b)` triple; the
+// policy projects it into typed relations it declares itself, e.g.
+//   TrustedDomain(d) :- PolicyMetadata("trusted_domain", d, _).
+//   CooldownDays(n)  :- PolicyMetadata("cooldown", v, _), n = to_number(v).
+// Keeps config out of the conversation graph and travels with the policy.
+.decl PolicyMetadata(rel: symbol, a: symbol, b: symbol)
+.input PolicyMetadata(rfc4180=true)
+
+/* ── Output Relations ─────────────────────────────────────────────── */
+
+// Backward reachability from Current node(s) only.
+// CurrentDepends(source) means "some Current node transitively depends on
+// source". It does NOT contain the Current messages themselves.
+.decl CurrentDepends(source_id: symbol)
+.output CurrentDepends(IO=stdout, rfc4180=true)
+
+// CurrentDependsPolicyRelevant() — gate predicate for the
+// graph-traversal rules below. When *false* for a given
+// authorization request, CurrentDepends produces the empty set, so
+// every helper that joins on CurrentDepends becomes trivially empty
+// without any traversal cost. Most policy denial helpers go through
+// CurrentDepends, so gating this one relation cuts the work for
+// irrelevant requests.
+//
+// Policy authors opt in by declaring rules that fire only for the
+// action types whose policy decisions actually depend on prior
+// graph state — for example, a reservation policy:
+//
+//   CurrentDependsPolicyRelevant() :- IsTool(_, "cancel_reservation").
+//   CurrentDependsPolicyRelevant() :- IsTool(_, "update_reservation_flights").
+//   ...
+//
+// When the policy doesn't declare any rule for this relation,
+// sugar.py emits a default ``CurrentDependsPolicyRelevant().`` fact
+// so the gate is always satisfied and ``CurrentDepends`` is always
+// computed. Authors who want the optimization replace the default by
+// writing custom rules.
+.decl CurrentDependsPolicyRelevant()
+.output CurrentDependsPolicyRelevant(IO=stdout, rfc4180=true)
+
+// ReachableFromPolicyRelevant() — narrower gate for the recursive
+// reachability relation below. ``ReachableFrom`` is strictly more
+// expensive than ``CurrentDepends`` (it's pairwise reachability,
+// not single-source) and many write-tool actions never consume it.
+// Gated separately so an action that needs ``CurrentDepends`` but
+// not ``ReachableFrom`` can opt in to one and not the other.
+//
+// Same default-rule treatment as ``CurrentDependsPolicyRelevant``:
+// sugar.py emits a trivially-true fact when the policy doesn't
+// declare custom rules.
+.decl ReachableFromPolicyRelevant()
+.output ReachableFromPolicyRelevant(IO=stdout, rfc4180=true)
+
+// Implication: ReachableFromPolicyRelevant entails
+// CurrentDependsPolicyRelevant. ``ReachableFrom``'s base case
+// joins on ``CurrentDepends``, so a policy that flips on
+// ``ReachableFromPolicyRelevant`` for some tool but forgets to
+// flip on ``CurrentDependsPolicyRelevant`` would otherwise see
+// ``ReachableFrom`` stay empty (because ``CurrentDepends`` would
+// be empty). This rule closes that footgun without forcing
+// authors to write the dependency by hand.
+CurrentDependsPolicyRelevant() :- ReachableFromPolicyRelevant().
+
+// Main authorization output
+.decl Authorized(idx: unsigned)
+.output Authorized(IO=stdout, rfc4180=true)
+
+// Allowlist and denylist (index-based)
+.decl IsAuthorized(idx: unsigned)
+.output IsAuthorized(IO=stdout, rfc4180=true)
+
+.decl Unauthorized(idx: unsigned)
+.output Unauthorized(IO=stdout, rfc4180=true)
+
+// Denial reasons — correct by construction (only fired rules produce tuples).
+// `kind` is "block" (hard deny) or "ask" (soft deny: the reference monitor
+// prompts the user instead of denying when an approval channel exists; the
+// host decides ask-vs-deny). sugar.py rewrites annotated `Unauthorized` rules
+// into `DenialReason(idx, kind, reason, suggestion)` ("ask" iff the rule
+// carries `// @ask`, else "block"). Policies may also write DenialReason
+// directly. The allow/ask/deny decision is computed by the engine from the
+// reason kinds (deny > ask > allow).
+.decl DenialReason(idx: unsigned, kind: symbol, reason: symbol, suggestion: symbol)
+.output DenialReason(IO=stdout, rfc4180=true)
+
+// A *block*-kind DenialReason implies Unauthorized (hard deny). "ask"-kind
+// reasons do NOT — they leave the action authorized at the Datalog level; the
+// engine downgrades it to a user prompt (deny > ask > allow precedence).
+// @broad: this is the catch-all deny that carves from
+//   any allow rule via DenialReason. Annotated so the
+//   contradiction analyzer treats overlaps with this
+//   rule as ExpectedCarveOut rather than flagging every
+//   user IsAuthorized rule against it.
+Unauthorized(idx) :- DenialReason(idx, "block", _, _).
+
+// Sentinel: an authenticated principal exists for this request.
+.decl HasPrincipal()
+.output HasPrincipal(IO=stdout, rfc4180=true)
+
+// True when the authenticated principal holds `role` (see the
+// `HasRole` rule below, which reads `PrincipalRole`). It is the
+// principal's role, not the caller-supplied `Entity`'s.
+.decl HasRole(role: symbol)
+.output HasRole(IO=stdout, rfc4180=true)
+
+// Credential injection: `transform_id` names a rule in the engine's
+// transforms configuration, which says which header or query parameter to
+// fill and with which stored credential. A transform is applied only when
+// the action is authorized, and only on the HTTP proxy path.
+.decl ApplyTransform(idx: unsigned, transform_id: symbol)
+.output ApplyTransform(IO=stdout, rfc4180=true)
+
+// What the HTTP proxy does with an action it could not authorize.
+// AllowPassthrough(idx) forwards the request unchanged and without
+// transforms; without it the proxy rejects the request, which
+// DenyUnauthorized(idx) states explicitly. Tool-call checks ignore both:
+// an unauthorized tool call is always denied.
+.decl DenyUnauthorized(idx: unsigned)
+.output DenyUnauthorized(IO=stdout, rfc4180=true)
+
+.decl AllowPassthrough(idx: unsigned)
+.output AllowPassthrough(IO=stdout, rfc4180=true)
+
+/* ── C++ Functors ─────────────────────────────────────────────────── */
+
+// String operations
+.functor str_contains(s: symbol, sub: symbol): unsigned stateful
+.functor str_starts_with(s: symbol, prefix: symbol): unsigned stateful
+.functor str_to_lower(s: symbol): symbol stateful
+.functor str_len(s: symbol): number stateful
+// 1 iff the string carries Unicode Tags-block codepoints (U+E0000–U+E007F),
+// the channel for invisible prompt-injection text.
+.functor has_unicode_tags(s: symbol): unsigned stateful
+// 1 iff the string carries ANY invisible / display-deceptive codepoint —
+// superset of has_unicode_tags adding bidi overrides (Trojan Source), zero-width
+// / invisible format chars, and variation-selector byte smuggling. Low-FP
+// (excludes ZWJ/ZWNJ and lone emoji presentation selectors).
+.functor has_deceptive_unicode(s: symbol): unsigned stateful
+// Severity split of has_deceptive_unicode. 2 = a class that is deceptive by
+// construction or can hide a payload the Tags decoder never sees (Tags block,
+// bidi overrides/isolates, variation-selector byte channel, interlinear
+// annotation — where a "run" of selectors means two inside one invisible blob,
+// interleaved invisibles included) — never exemptible. 1 = payload-free format
+// chars (ZWSP, BOM, soft hyphen, …) past the harmless bound: more than 4 of
+// them, or two in one contiguous invisible run (any visible char breaks the run;
+// an invisible one does not). 1 also = BULK BLANK PADDING: more than 256
+// characters that are invisible, in no class at all, and sitting in RUNS of two
+// or more (a lone one displaces nothing and is ordinary in Persian/Arabic/Indic
+// text, where U+200C separates words) — the default-ignorable
+// PROPERTY rather than a list, so no codepoint substitution escapes the tally
+// (the Braille blank, the Hangul fillers, ZWJ/ZWNJ, the bidi marks, …). Those
+// carry nothing, but in volume they push earlier content out of the window the
+// agent can still see and pad a message past where a human stops reading — a
+// context-window attack rather than a hidden payload, so it gets its own count
+// and leaves the format bound alone. 0 = clean, or a few scattered format
+// chars. Word POSITION is deliberately not a trigger: a split defeats only a
+// LITERAL match, and a source-side substring test that unlocks a gate fails
+// shut when the word is split; the action-side tests keep the strict
+// has_deceptive_unicode.
+// 1 iff a codepoint that renders as nothing, and is in NO deceptive class, sits
+// in a COMMAND position of `cmd` rather than in its data — the set
+// has_deceptive_unicode passes over, which is harmless in prose but disguises
+// what runs when it is in a program name (an executable really named
+// `cu<U+200D>rl` reads as curl, runs, and matches neither gate). Quoted regions
+// and here-doc bodies are data and do not count; a substitution inside double
+// quotes is code and does. Shares the tokenizer with cmd_runs_sub.
+.functor cmd_hidden_in_code(cmd: symbol): unsigned stateful
+.functor deceptive_unicode_class(s: symbol): unsigned stateful
+// Registrable domain (eTLD+1) of the first URL/host in the string, lowercased,
+// or "" — for host-allowlist matching that resists subdomain/path confusion.
+.functor registrable_domain(s: symbol): symbol stateful
+// Hidden Tags-block text (U+E0000–U+E007F) decoded to ASCII, "" if none — to
+// surface invisible prompt-injection content to the user.
+.functor decode_unicode_tags(s: symbol): symbol stateful
+// A short description of WHAT invisible / display-deceptive characters a string
+// carries, for the approval prompt: one clause per class, each naming the
+// class's most frequent codepoint with an exact count ("1 bidirectional
+// override (U+202E) …", "12000 invisible blanks (U+2800) …"), plus the decoded
+// Tags-block text where there is any. Needed because decode_unicode_tags is
+// EMPTY for every class that hides no readable text (a bidi override, blank
+// padding, a Tags framing char), which read as "nothing was found". Counts and
+// U+XXXX names only — never a payload character — capped at 200 chars; "" when
+// the string carries nothing.
+.functor deceptive_unicode_summary(s: symbol): symbol stateful
+// Command lowercased + whitespace-collapsed + line-continuations removed, so the
+// dangerous-command gates match case/spacing-insensitively.
+.functor normalize_cmd(s: symbol): symbol stateful
+// Number of fetch targets (URLs and bare hosts) that `s` names; it
+// over-counts rather than under-counts.
+.functor count_urls(s: symbol): unsigned stateful
+// 1 iff `s` has an `rm` with both recursive and force flags, any ordering
+// (-rf/-fr/-vrf/-r -f/--recursive --force); positional paths ignored.
+.functor dangerous_rm(s: symbol): unsigned stateful
+// 1 iff `tool` is run as a command in `cmd` (a command-position token,
+// basenamed) — NOT when the name only appears inside an argument (echo-spoof).
+.functor cmd_invokes(cmd: symbol, tool: symbol): unsigned stateful
+// 1 iff `cmd` runs program `prog` (command position, basenamed) whose first
+// non-flag argument (the subcommand) equals `sub`. Skips value-taking global
+// flags' values (-C/-c/--git-dir/…), so `git -C x push` reads `push`; handles
+// ;/&/|/newline separators + compounds (`git commit && git push`).
+.functor cmd_runs_sub(cmd: symbol, prog: symbol, sub: symbol): unsigned stateful
+// 0/1/2 classifying whether egress program `prog` actually RUNS in `cmd` (same
+// token scanner as cmd_runs_sub: wrappers, $()/backtick, quote-aware). 2 = runs at
+// a command position (deny); 1 = name present but execution unprovable — variable
+// indirection (`x=curl; $x`) or a bare-name arg to a possible unknown wrapper
+// (@ask); 0 = absent or only quoted/fragment DATA, provably non-executed (allow).
+// Fails toward 1/2, never silently to 0.
+.functor cmd_egress_class(cmd: symbol, prog: symbol): unsigned stateful
+
+// JSON operations
+.functor json_get_str(json: symbol, field: symbol): symbol stateful
+.functor json_get_int(json: symbol, field: symbol): number stateful
+.functor json_has_field(json: symbol, field: symbol): unsigned stateful
+// Dotted/bracketed path access for nested JSON, e.g.
+// @json_get_str_path(result, "payment_history[0].payment_method_id").
+.functor json_get_str_path(json: symbol, path: symbol): symbol stateful
+.functor json_get_int_path(json: symbol, path: symbol): number stateful
+// Array element access: len, string element, field-of-object element.
+.functor json_array_len(json: symbol, path: symbol): unsigned stateful
+.functor json_array_get_str(json: symbol, path: symbol, idx: unsigned): symbol stateful
+.functor json_array_get_field_str(json: symbol, path: symbol, idx: unsigned, field: symbol): symbol stateful
+// Object key membership at a given path.
+.functor json_object_has_key(json: symbol, path: symbol, key: symbol): unsigned stateful
+// Convenience for nested-object integer access via a dynamic key:
+// equivalent to @json_get_int_path(json, base_path + "." + key + sub_path)
+// but without runtime string concatenation in Datalog.
+.functor json_object_field_int(json: symbol, base_path: symbol, key: symbol, sub_path: symbol): number stateful
+
+// URL operations
+.functor url_host(url: symbol): symbol stateful
+
+// Datetime operations
+// Returns the absolute difference in hours between two ISO 8601 timestamps.
+// Accepts formats: "2024-05-15T15:00:00", "2024-05-15 15:00:00", "2024-05-15T15:00:00Z"
+// Returns -1 if either timestamp fails to parse.
+.functor hours_between(t1: symbol, t2: symbol): number stateful
+
+// LLM semantic check (memoized)
+.functor llm_check_fn(prompt: symbol, context: symbol): unsigned stateful
+
+/* ── Utility Relations ────────────────────────────────────────────── */
+
+// Helper: check if an action queries a specific URL host
+.decl QueriesHost(action: Action, host: symbol)
+QueriesHost(a, host) :-
+    Actions(_, a),
+    a = $HTTPRequest(url, _, _),
+    @url_host(url) = host,
+    host != "".
+
+// Helper: check if an action is a specific tool call
+.decl IsTool(action: Action, fn_name: symbol)
+IsTool(a, name) :-
+    Actions(_, a),
+    a = $CallTool(name, _).
+
+// Helper: check if action is any tool call
+.decl IsToolCall(action: Action)
+IsToolCall(a) :-
+    Actions(_, a),
+    a = $CallTool(_, _).
+
+// Note: For tool argument extraction, use functors directly in rules:
+//   a = $CallTool(_, args), val = @json_get_str(args, "field_name"), val != ""
+// Generic ToolArgStr/ToolArgInt relations cannot be defined without
+// a bound set of field names (Soufflé requires grounded variables).
+
+/* ── Graph Dependency Propagation ─────────────────────────────────── */
+
+// CurrentDepends(source) — backward reachability from Current nodes
+// gated on CurrentDependsPolicyRelevant() so policies can opt out of
+// graph traversal for action types that don't need prior context.
+CurrentDepends(src) :- CurrentDependsPolicyRelevant(), Current(id), Edge(src, id).
+CurrentDepends(src) :- CurrentDepends(mid), Edge(src, mid).
+
+// ReachableFrom(s, d) — forward reachability over the dependency
+// graph, scoped to the backward slice of the current action so it
+// only enumerates pairs whose endpoints both depend on Current.
+// Used by policies to order writes to the same resource (e.g.,
+// "the most recent update_reservation_flights for res_id").
+//
+// Gated by ``ReachableFromPolicyRelevant`` rather than
+// ``CurrentDependsPolicyRelevant``: this relation is strictly more
+// expensive than ``CurrentDepends`` and a meaningful subset of
+// write-tool actions don't consume it (e.g. a write tool whose rules
+// only need ``CurrentDepends``). The narrower gate lets those actions skip pairwise
+// reachability while still building ``CurrentDepends`` for their
+// own denial rules.
+.decl ReachableFrom(source: symbol, dest: symbol)
+.output ReachableFrom(IO=stdout, rfc4180=true)
+ReachableFrom(s, d) :-
+    ReachableFromPolicyRelevant(),
+    CurrentDepends(s), CurrentDepends(d),
+    Edge(s, d).
+ReachableFrom(s, d) :-
+    Edge(s, mid),
+    ReachableFrom(mid, d).
+
+/* ── Tool Result Field Extraction ────────────────────────────────── */
+
+// ── Tool Result Field Extraction ─────────────────────────
+//
+// Use ToolResultField to check attributes returned by tool
+// calls earlier in the conversation. This is the primary
+// mechanism for attribute-based policies — when the policy
+// depends on data that a tool returned (e.g., a user's
+// membership level, an order's status, a document's
+// classification), use ToolResultField to access it.
+//
+// Usage in policy files:
+//
+//   1. Declare which JSON fields you need:
+//      ToolResultFieldName("status").
+//      ToolResultFieldName("role").
+//
+//   2. Use ToolResultField in rules:
+//      // Deny if the order status is "shipped"
+//      Unauthorized(idx) :-
+//          Actions(idx, a),
+//          IsTool(a, "cancel_order"),
+//          ToolResultField("get_order", "status", "shipped").
+//
+//      // Deny if role is NOT "admin"
+//      Unauthorized(idx) :-
+//          Actions(idx, a),
+//          IsTool(a, "delete_user"),
+//          !ToolResultField("get_user", "role", "admin").
+//
+//   3. Guard rules — deny if the prerequisite lookup has
+//      not happened yet (the field is unknown):
+//      Unauthorized(idx) :-
+//          Actions(idx, a),
+//          IsTool(a, "cancel_order"),
+//          !ToolResultField("get_order", "status", _).
+//
+// The relation is scoped to the current conversation's
+// dependency graph via CurrentDepends, so different
+// conversations never mix.
+//
+.decl ToolResultFieldName(name: symbol)
+.decl ToolResultField(tool: symbol, field: symbol, value: symbol)
+.output ToolResultField(IO=stdout, rfc4180=true)
+ToolResultField(tool, field, value) :-
+    CurrentDepends(mid),
+    ToolResult(mid, tool, _),
+    SentMessage(mid, msg),
+    ToolResultFieldName(field),
+    value = @json_get_str(msg.contents, field),
+    value != "".
+
+/* ── Inputs of Unknown Origin ─────────────────────────────────────── */
+
+// ── Unattributed external input ──────────────────────────
+//
+// An instrumentation adapter records a value it consumed but
+// cannot attribute — a message handed back without the
+// adapter's mark, a state value or artifact another process
+// wrote, a value from a different SASY session — as a message
+// whose text is a small JSON object with
+// ``"provenance": "unattributed external input"``. The run
+// continues and the consuming message depends on that node, so
+// the graph shows what happened and a policy decides what it is
+// worth.
+//
+// UnattributedInput(id) holds for every such node this request
+// depends on, including a node the request consumed directly.
+// DependsOnUnattributedInput() is the same question without the
+// identifier.
+//
+// Usage in policy files:
+//
+//   // Refuse to publish anything computed from an input whose
+//   // origin the adapter could not establish.
+//   Unauthorized(idx) :-
+//       Actions(idx, a),
+//       IsTool(a, "publish"),
+//       DependsOnUnattributedInput().
+//
+//   // Or narrow it to values that came from another session:
+//   Unauthorized(idx) :-
+//       Actions(idx, a),
+//       IsTool(a, "publish"),
+//       UnattributedInputOrigin(_, "another SASY session").
+//
+// A node of unknown origin carries no successful-tool evidence,
+// so a rule that requires a ``ToolResult`` already refuses it.
+// These relations are for the opposite direction: noticing that
+// something unattributed reached the action at all.
+//
+.decl UnattributedInput(id: symbol)
+.output UnattributedInput(IO=stdout, rfc4180=true)
+UnattributedInput(id) :-
+    Current(id),
+    SentMessage(id, msg),
+    @json_get_str(msg.contents, "provenance") = "unattributed external input".
+UnattributedInput(id) :-
+    CurrentDepends(id),
+    SentMessage(id, msg),
+    @json_get_str(msg.contents, "provenance") = "unattributed external input".
+
+.decl DependsOnUnattributedInput()
+.output DependsOnUnattributedInput(IO=stdout, rfc4180=true)
+DependsOnUnattributedInput() :- UnattributedInput(_).
+
+// The adapter labels an input it can place, without trusting it:
+// a value from another SASY session is recorded with
+// ``"origin": "another SASY session"``. An input with no origin
+// label appears in UnattributedInput only.
+.decl UnattributedInputOrigin(id: symbol, origin: symbol)
+.output UnattributedInputOrigin(IO=stdout, rfc4180=true)
+UnattributedInputOrigin(id, origin) :-
+    UnattributedInput(id),
+    SentMessage(id, msg),
+    origin = @json_get_str(msg.contents, "origin"),
+    origin != "".
+
+/* ── Core Authorization Logic ─────────────────────────────────────── */
+
+HasPrincipal() :- Principal(_).
+HasRole(role) :- Principal(p), PrincipalRole(p, role).
+
+// An action is authorized if:
+// 1. There's an authenticated principal
+// 2. The action is on the allowlist (IsAuthorized)
+// 3. The action is NOT on the denylist (Unauthorized)
+Authorized(idx) :-
+    HasPrincipal(),
+    IsAuthorized(idx),
+    !Unauthorized(idx).
+
+IsAuthorized(idx) :- Actions(idx, _).

@@ -1,0 +1,929 @@
+/* AgentDojo policy (Soufflé)
+
+   One policy for all four AgentDojo suites — banking, Slack, travel and
+   workspace. Nothing suite-specific is written here: the tool taxonomy
+   arrives as PolicyMetadata facts at upload time (see
+   `sasy_agentdojo/policy_metadata.py`), so switching suites means shipping a
+   different metadata block, not a different policy. The same metadata block
+   carries the switches below; each is named by its metadata fact and by the
+   `run.py` flag that emits it.
+
+   "Tainted" means something from an untrusted source is in the backward slice
+   of the call being checked. "Anchored" means somebody with standing — the
+   user, a tool the operator controls, the operator's own domain or directory —
+   put the value in front of the agent.
+
+   Always on:
+     1+2  A tainted sink whose destination is not anchored is refused.
+     2b   A sink or answer carrying more destinations, identifiers or names than
+          the bounded walk reaches (32) is refused.
+     3    A tainted outbound message whose body carries an identifier that is
+          not anchored is refused.
+     4b   A new credential must appear in the user's request.
+   On except in trusted-action mode:
+     I    Intent: a tool with a declared effect kind needs the user's request
+          to ask for an effect of that kind.
+     5    An answer naming a catalogued type of business that the catalogue does
+          not list and the user never mentioned is refused.
+   Switched:
+     2c   gate_unanchorable  (--gate-unanchorable) a tainted sink that names no
+          destination at all is refused.
+     F    confidentiality  (--confidentiality; implied by --strict-taint) once
+          the user's own data is in context, a disclosing destination must be
+          anchored.
+     TA   strict_taint  (--strict-taint) trusted action, the IFC arm: no sink
+          once tainted, whatever its arguments.
+     B    browse_exception  (--browse-exception) a user-requested fetch of a
+          URL that cannot carry data out is exempt from 1+2.
+     S    selection_check  (--selection-check) where the request names a
+          criterion the listing settles, the target must be the one it selects.
+     T    strict_consent  (--strict-consent) the target of a classified effect
+          must be named by the user or selected by their criterion.
+     W    dictated_content  (--dictated-content) a field copied verbatim out of
+          an outsider's text is refused.
+     K    account_provenance  (--account-provenance) an account-number
+          destination must come from the user's request or the operator's
+          records.
+   The fetch gate (--fetch-gate) is not a rule: it declares the URL-fetching
+   tools as sinks with a URL destination, so the rules above apply to them.
+*/
+
+/* ── Custom functors (agentdojo_functors.cpp) ───────────────────── */
+
+// 1 iff `needle` occurs in `haystack` after both are folded to lower-case
+// alphanumerics — so a differently formatted IBAN or URL still matches.
+.functor contains_identifier(haystack: symbol, needle: symbol): unsigned stateful
+// Whole-value equality under the same folding, for directory lookups.
+.functor identifier_eq(a: symbol, b: symbol): unsigned stateful
+// The k-th address / host / account number inside a block of text, "" past
+// the end.
+.functor nth_identifier(text: symbol, k: unsigned): symbol stateful
+// The k-th capitalised multi-word name whose last word is one of the
+// `|`-separated suffixes — how the policy sees a business named in prose
+// rather than an address in a field.
+.functor nth_catalog_entity(text: symbol, suffixes: symbol, k: unsigned): symbol stateful
+// 1 iff the name is one of the `|`-separated category headings.
+.functor is_generic_entity(name: symbol, generics: symbol): unsigned stateful
+// A catalogued name with its trailing TYPE word removed. The catalogue stores
+// "Riverside View"; an answer says "Riverside View Hotel". Without the strip,
+// appending a type word to a real business name defeats the check.
+.functor entity_core(name: symbol, suffixes: symbol): symbol stateful
+// Does the user's request ask for an effect of this KIND? Per kind, so a
+// request to delete a file does not also authorise a credential change.
+.functor requests_effect_kind(text: symbol, kind: symbol): unsigned stateful
+// Is this value an account number? A claim about the KIND of the argument,
+// which a label comparison cannot make: the label says where the CALL stands,
+// not what this particular value is.
+.functor is_account_number(value: symbol): unsigned stateful
+// Can this URL carry data OUT — a query, a fragment, or userinfo? A plain
+// scheme://host/path sends nothing the agent read.
+.functor url_carries_data(value: symbol): unsigned stateful
+// Was this whole field value copied verbatim out of an outsider's text?
+.functor is_dictated(haystack: symbol, needle: symbol): unsigned stateful
+// The same question asked record by record, so a colleague's words inside a
+// mixed result are not mistaken for an outsider's.
+.functor is_dictated_by_outsider(haystack: symbol, needle: symbol, own_domains: symbol, own_principals: symbol): unsigned stateful
+// 1 iff the text names the calendar day of an ISO date value ("2025-01-11",
+// optionally with a time of day and nothing else) — verbatim, or in English prose
+// with a month name beside the day number ("January 11th", "the 1st to the
+// 5th of May 2024").
+.functor mentions_date(text: symbol, value: symbol): unsigned stateful
+// The criterion the user's request names — "size", "price", "rating",
+// "recency" — or empty when it names none.
+.functor criterion_class(text: symbol): symbol stateful
+.functor criterion_wants_max(text: symbol): unsigned stateful
+// The identifier of the record that WINS that criterion, recomputed from the
+// listing the agent read.
+.functor selected_id(listing: symbol, id_field: symbol, value_field: symbol, want_max: unsigned): symbol stateful
+// 1 iff the value's host is the domain, or a subdomain of it. Not a substring
+// test: "bluesparrowtech.com.evil.example" is not internal.
+.functor host_in_domain(value: symbol, domain: symbol): unsigned stateful
+// How many identifiers / catalogued names a block of text carries, so the
+// policy can tell when a bounded walk did not reach the end.
+.functor identifier_count(text: symbol): unsigned stateful
+.functor catalog_entity_count(text: symbol, suffixes: symbol): unsigned stateful
+
+/* ── Taxonomy, supplied as policy metadata ──────────────────────── */
+
+// A tool whose result can contain text an outside party wrote.
+.decl UntrustedSource(fn: symbol)
+UntrustedSource(fn) :- PolicyMetadata("untrusted_source", fn, _).
+
+// A tool whose result comes from the operator's own system of record.
+.decl TrustedSource(fn: symbol)
+TrustedSource(fn) :- PolicyMetadata("trusted_source", fn, _).
+
+// A tool whose result is the user's own data. Separate from `UntrustedSource`,
+// which is an integrity claim; this is a confidentiality one. A public web page
+// is untrusted and not confidential; an inbox is both; the operator's published
+// catalogue is neither.
+.decl ConfidentialSource(fn: symbol)
+ConfidentialSource(fn) :- PolicyMetadata("confidential_source", fn, "").
+
+// A tool that changes durable state or sends data to someone.
+.decl Sink(fn: symbol)
+Sink(fn) :- PolicyMetadata("sink", fn, _).
+
+// The argument of a sink naming who receives the effect.
+.decl DestinationField(fn: symbol, field: symbol)
+DestinationField(fn, f) :- PolicyMetadata("destination_field", fn, f).
+
+// The argument of a sink carrying free text the agent composed.
+.decl BodyField(fn: symbol, field: symbol)
+BodyField(fn, f) :- PolicyMetadata("body_field", fn, f).
+
+// A tool whose destination argument is a URL. Declared by the operator, because
+// whether an argument is a URL is a fact about the tool, not about the value.
+.decl UrlSinkField(fn: symbol)
+UrlSinkField(fn) :- PolicyMetadata("url_sink", fn, "").
+
+// Which kind of effect a tool has — "delete", "credential", "lodging", ... —
+// for the intent rule. `policy_metadata.build` refuses a configuration where a
+// tool marked irreversible has no kind, so every irreversible tool is covered.
+.decl EffectKind(fn: symbol, kind: symbol)
+EffectKind(fn, k) :- PolicyMetadata("effect_kind", fn, k).
+
+// A sink argument whose value has to originate in the user's request.
+.decl ValueFromUser(fn: symbol, field: symbol)
+ValueFromUser(fn, f) :- PolicyMetadata("value_from_user", fn, f).
+
+// Domains belonging to the organisation running the agent. Matched on the
+// host, never as a substring.
+.decl OwnDomain(d: symbol)
+OwnDomain(d) :- PolicyMetadata("own_domain", d, _).
+
+// Every own domain as one delimited value. Datalog has no set-valued functor
+// argument, and the record split in rule W needs them all at once to decide
+// which records a colleague wrote.
+.decl OwnDomainList(ds: symbol)
+OwnDomainList(ds) :- PolicyMetadata("own_domain_list", ds, _).
+
+// Principals the operator knows by name rather than by address — a chat roster.
+// Empty when the deployment has none, which makes every record an outsider's.
+.decl OwnPrincipalList(ps: symbol)
+OwnPrincipalList("") :- !PolicyMetadata("own_principal_list", _, _).
+OwnPrincipalList(ps) :- PolicyMetadata("own_principal_list", ps, _).
+
+// The user themselves, by address or by name. Kept apart from OwnDomain
+// because a personal name is not a domain: matching "emma" as though it were
+// one made every destination containing those four letters internal.
+.decl OwnIdentity(v: symbol)
+OwnIdentity(v) :- PolicyMetadata("own_identity", v, _).
+
+// The last word of the entity types this operator keeps a catalogue of, as
+// one `|`-separated value — "Hotel|Restaurant|Rentals". Only types with a
+// catalogue belong here: rule 5 refuses a name of one of these types that the
+// catalogue does not list, so a type the operator cannot vouch for either way
+// would refuse everything.
+//
+// One delimited value rather than one fact per suffix because the policy never
+// joins on these — it only iterates them into a functor — and Datalog has no
+// set-valued functor argument, so a relation of N suffixes forces an N-way
+// cross product with the index relation. The values stay deployment
+// configuration either way.
+.decl EntitySuffixes(list: symbol)
+EntitySuffixes(l) :- PolicyMetadata("entity_suffix", l, _).
+
+// Category names that read like entity names but vouch for nothing — the
+// headings an answer is organised under. "Car Rental" is a section title;
+// "Eiffel Tower Car Rental" is a business. Without this the heading itself is
+// treated as a business the catalogue does not list, and a perfectly ordinary
+// answer gets taken apart. Same delimited shape, same reason.
+.decl GenericEntities(list: symbol)
+GenericEntities(l) :- PolicyMetadata("entity_generic", l, _).
+
+// The tool the agent's own answer arrives as. A response is an outbound
+// message like any other; naming it here keeps rule 5 in the same shape as
+// every other sink rather than inventing a second mechanism.
+.decl ResponseTool(fn: symbol)
+ResponseTool(fn) :- PolicyMetadata("response_tool", fn, _).
+
+// Rule-S and rule-T configuration, all operator-declared: which argument names
+// the chosen thing, how records are identified in that tool's listings, and
+// which listing field a criterion class corresponds to.
+.decl SelectionTarget(fn: symbol, argname: symbol)
+SelectionTarget(fn, a) :- PolicyMetadata("selection_target", fn, a).
+
+.decl SelectionIdField(fn: symbol, field: symbol)
+SelectionIdField(fn, f) :- PolicyMetadata("selection_id_field", fn, f).
+
+.decl SelectionField(fn: symbol, cls: symbol, field: symbol)
+SelectionField(fn, cls, f) :- PolicyMetadata("selection_field", fn, cls_field),
+    cls = @json_get_str(cls_field, "class"), f = @json_get_str(cls_field, "field").
+
+// Kinds rule T does not govern, because the policy has no value it can
+// meaningfully call the target.
+//
+// A page read changes nothing and discloses nothing, so "which page" is not a
+// consent question the way "which file to delete" is; `browse` carries a kind
+// only so the browse exception can ask whether the user wanted a page read at
+// all, and without this exclusion the target rule demanded the URL be
+// identified too and refused six clean tasks for it.
+//
+// A calendar event's target is the event — its title and time — and an
+// injection writes both. Checking the participant instead asks the wrong
+// question and answers it "yes": told only that the call "names no
+// destination", an agent adds the user's own address and the attacker's event
+// is created. These kinds are gated by INTENT alone.
+.decl TargetExemptKind(kind: symbol)
+TargetExemptKind(k) :- PolicyMetadata("target_exempt_kind", k, "").
+
+// Arguments rule W inspects in addition to the message body. A URL is not
+// composed prose, but "did an outsider hand the agent this exact value" is
+// still the right question — and for a fetch it is the ONLY question, since
+// the whole attack is the destination.
+.decl DictatedField(fn: symbol, field: symbol)
+DictatedField(fn, f) :- BodyField(fn, f).
+DictatedField(fn, f) :- PolicyMetadata("dictated_field", fn, f).
+
+/* ── Switches, supplied as policy metadata ──────────────────────── */
+
+// Trusted action (the IFC arm). See the rule for what it does and what it gives
+// up.
+.decl StrictTaint()
+StrictTaint() :- PolicyMetadata("strict_taint", _, _).
+
+// The permitted-flow rule. Separate from `StrictTaint` because the two are
+// independent halves: integrity asks whether what the agent read can be
+// believed, confidentiality asks whether what it holds may leave.
+.decl Confidentiality()
+Confidentiality() :- PolicyMetadata("confidentiality", _, _).
+
+// Rule 2c.
+.decl GateUnanchorable()
+GateUnanchorable() :- PolicyMetadata("gate_unanchorable", _, _).
+
+.decl BrowseException()
+BrowseException() :- PolicyMetadata("browse_exception", _, _).
+
+// Rule S.
+.decl SelectionCheck()
+SelectionCheck() :- PolicyMetadata("selection_check", _, _).
+
+// Rule T.
+.decl StrictConsent()
+StrictConsent() :- PolicyMetadata("strict_consent", _, _).
+
+// Rule W.
+.decl DictatedContent()
+DictatedContent() :- PolicyMetadata("dictated_content", _, _).
+
+// Rule K.
+.decl AccountProvenance()
+AccountProvenance() :- PolicyMetadata("account_provenance", _, _).
+
+/* ── Bounded index ──────────────────────────────────────────────── */
+
+// Bounded walk over list-valued arguments, the identifiers in a message body,
+// and the names in an answer: 0..32. The bound is a real limit, not a
+// formality: a value past the end is a value the policy never inspects, which
+// is why rule 2b refuses a call whose lists run longer than 32.
+.decl Idx(i: unsigned)
+Idx(i) :- IdxTens(t), IdxOnes(o), i = t + o, i < 33.
+.decl IdxTens(i: unsigned)
+IdxTens(0). IdxTens(8). IdxTens(16). IdxTens(24). IdxTens(32).
+.decl IdxOnes(i: unsigned)
+IdxOnes(0). IdxOnes(1). IdxOnes(2). IdxOnes(3).
+IdxOnes(4). IdxOnes(5). IdxOnes(6). IdxOnes(7).
+
+/* ── Gating ─────────────────────────────────────────────────────── */
+
+// Only sinks consult the dependency graph; reads never do.
+CurrentDependsPolicyRelevant() :- Actions(_, a), a = $CallTool(fn, _), Sink(fn).
+// The response check needs it too. `respond` is a ResponseTool and deliberately
+// NOT a Sink, so without this clause a response check ran with an empty slice:
+// no `CurrentDepends`, and therefore no `UserRequest` and no `TrustedText`. The
+// rule could then only anchor an entity through `ActionMetadata`, which meant
+// it could not recognise a business the user had named in their own request. It
+// was masked in travel because the monitor hands the whole catalogue in as
+// metadata, so the missing half never showed.
+CurrentDependsPolicyRelevant() :-
+    Actions(_, a), a = $CallTool(fn, _), ResponseTool(fn).
+
+/* ── Context ────────────────────────────────────────────────────── */
+
+// The user's own request. AgentDojo runs one request per session, so this
+// is a single tuple; with a multi-turn front end it becomes the set of
+// things the user has actually asked for.
+.decl UserRequest(q: symbol)
+.output UserRequest
+UserRequest(q) :-
+    CurrentDepends(id),
+    SentMessage(id, msg),
+    msg.agent_role = $UserRole(),
+    q = msg.contents,
+    q != "".
+
+// Text the agent may treat as authoritative: the request itself, plus
+// results from tools the operator controls.
+.decl TrustedText(text: symbol)
+TrustedText(q) :- UserRequest(q).
+TrustedText(t) :-
+    CurrentDepends(id),
+    ToolResult(id, fn, _),
+    TrustedSource(fn),
+    SentMessage(id, msg),
+    t = msg.contents,
+    t != "".
+
+// The dual: text an outsider may have written. Used for a POSITIVE test —
+// "this value was copied from here" — rather than the absence of evidence the
+// anchoring rules test for. The two catch different things: a value can be
+// absent from all trusted text because the agent invented it, which anchoring
+// refuses and this permits; and a value can appear in trusted text by
+// coincidence while having been copied from an injection, which anchoring
+// permits and this refuses.
+.decl UntrustedText(text: symbol)
+UntrustedText(t) :-
+    CurrentDepends(id),
+    ToolResult(id, fn, _),
+    UntrustedSource(fn),
+    SentMessage(id, msg),
+    t = msg.contents,
+    t != "".
+
+// True once any untrusted content has entered the backward slice of the
+// call under evaluation.
+.decl CurrentTainted()
+.output CurrentTainted
+CurrentTainted() :-
+    CurrentDepends(id),
+    ToolResult(id, fn, _),
+    UntrustedSource(fn).
+
+// Has the agent read any of the user's data in this session?
+.decl CurrentConfidential()
+.output CurrentConfidential
+CurrentConfidential() :-
+    CurrentDepends(id),
+    ToolResult(id, fn, _),
+    ConfidentialSource(fn).
+
+// The backward slice INCLUDING the node the check was handed.
+//
+// `CurrentDepends` is strictly the predecessors: `CurrentDepends(src) :-
+// Current(id), Edge(src, id)`. That is right for the flow rules, which ask what
+// the model could have READ before choosing this call — the call's own node is
+// not something it read. Rules S and T read listings, and within one assistant
+// batch the monitor re-syncs after each executed call, so the node handed to
+// the next check can BE the listing the agent just read — exactly the node a
+// non-reflexive slice leaves out. Defined here rather than in the shared schema
+// because only these rules want it.
+.decl CurrentAndDepends(id: symbol)
+CurrentAndDepends(id) :- Current(id).
+CurrentAndDepends(id) :- CurrentDepends(id).
+
+// Any tool result in the slice — the listings the agent read.
+.decl ListingText(text: symbol)
+ListingText(t) :-
+    CurrentAndDepends(id),
+    ToolResult(id, _, _),
+    SentMessage(id, msg),
+    t = msg.contents,
+    t != "".
+
+/* ── Destinations ───────────────────────────────────────────────── */
+
+// Every destination value the call carries, whether the argument is a
+// scalar or a list.
+.decl DestValue(idx: unsigned, fn: symbol, v: symbol)
+.output DestValue
+DestValue(i, fn, v) :-
+    Actions(i, a),
+    a = $CallTool(fn, args),
+    DestinationField(fn, f),
+    v = @json_get_str(args, f),
+    v != "".
+DestValue(i, fn, v) :-
+    Actions(i, a),
+    a = $CallTool(fn, args),
+    DestinationField(fn, f),
+    Idx(k),
+    k < @json_array_len(args, f),
+    v = @json_array_get_str(args, f, k),
+    v != "".
+
+// Does this call name any destination at all?
+.decl HasDestValue(idx: unsigned)
+HasDestValue(i) :- DestValue(i, _, _).
+
+// Identifiers — addresses, hosts, account numbers — carried inside the
+// text of an outbound message.
+.decl BodyIdent(idx: unsigned, fn: symbol, v: symbol)
+.output BodyIdent
+BodyIdent(i, fn, v) :-
+    Actions(i, a),
+    a = $CallTool(fn, args),
+    BodyField(fn, f),
+    Idx(k),
+    v = @nth_identifier(@json_get_str(args, f), k),
+    v != "".
+
+// Named entities the agent puts forward in its own answer.
+.decl ResponseEntity(idx: unsigned, e: symbol)
+.output ResponseEntity
+ResponseEntity(i, e) :-
+    Actions(i, a),
+    a = $CallTool(fn, args),
+    ResponseTool(fn),
+    EntitySuffixes(sfxs),
+    Idx(k),
+    e = @nth_catalog_entity(@json_get_str(args, "text"), sfxs, k),
+    e != "".
+
+// The values anchoring is asked about for a sink: its destinations and the
+// identifiers in its body.
+.decl AnchorCandidate(v: symbol)
+AnchorCandidate(v) :- DestValue(_, _, v).
+AnchorCandidate(v) :- BodyIdent(_, _, v).
+
+// A value is anchored when somebody with standing put it in front of the
+// agent: the user, a tool the operator controls, the operator's own domain,
+// or the monitor's own directory lookup. Anchored is only ever derived for
+// destination values, body identifiers and response entities.
+.decl Anchored(v: symbol)
+.output Anchored
+Anchored(v) :-
+    AnchorCandidate(v),
+    TrustedText(t),
+    @contains_identifier(t, v) = 1.
+Anchored(v) :-
+    AnchorCandidate(v),
+    OwnDomain(d),
+    @host_in_domain(v, d) = 1.
+Anchored(v) :-
+    AnchorCandidate(v),
+    OwnIdentity(u),
+    @identifier_eq(v, u) = 1.
+// The monitor resolves the destination against the operator's directory
+// itself and attaches the answer to the check, so the agent's context never
+// gets to vouch for a destination it read out of an attacker's text.
+Anchored(v) :-
+    AnchorCandidate(v),
+    ActionMetadata(_, "known_destination", n, _),
+    @identifier_eq(v, n) = 1.
+Anchored(e) :-
+    ResponseEntity(_, e),
+    TrustedText(t),
+    @contains_identifier(t, e) = 1.
+Anchored(e) :-
+    ResponseEntity(_, e),
+    ActionMetadata(_, "known_destination", n, _),
+    @identifier_eq(e, n) = 1.
+// The same, against the name with its type word stripped, which is the form the
+// catalogue stores. "Riverside View Hotel" is the catalogue's "Riverside View".
+Anchored(e) :-
+    ResponseEntity(_, e),
+    EntitySuffixes(sfxs),
+    ActionMetadata(_, "known_destination", n, _),
+    @identifier_eq(@entity_core(e, sfxs), n) = 1.
+Anchored(e) :-
+    ResponseEntity(_, e),
+    GenericEntities(g),
+    @is_generic_entity(e, g) = 1.
+
+// Anchored by somebody with standing to introduce a NEW party: the user's own
+// request, or the operator's records. Deliberately narrower than `Anchored`,
+// which also accepts any trusted tool output — for a value of a consequential
+// kind, "some trusted tool mentioned it" is not provenance enough. Used by
+// rules T and K.
+.decl StronglyAnchored(v: symbol)
+.output StronglyAnchored
+StronglyAnchored(v) :-
+    DestValue(_, _, v),
+    UserRequest(q),
+    @contains_identifier(q, v) = 1.
+StronglyAnchored(v) :-
+    DestValue(_, _, v),
+    ActionMetadata(_, "known_destination", n, _),
+    @identifier_eq(v, n) = 1.
+
+// The destinations a call could actually disclose THROUGH, for rule F.
+//
+// Every destination qualifies except one: a URL that cannot carry data. A fetch
+// is a flow, but `https://site.com/page` sends the host and the path and
+// nothing the agent read, so refusing it discloses nothing and costs a page
+// read. A query string, a fragment or userinfo is a different matter — that is
+// where an exfiltrated value would sit, and those stay in.
+//
+// The destination rules are unaffected: they still ask whether the host is
+// anchored. This is only about whether the call is a DISCLOSURE.
+.decl DisclosingDest(idx: unsigned, fn: symbol, v: symbol)
+DisclosingDest(i, fn, v) :-
+    DestValue(i, fn, v),
+    !UrlSinkField(fn).
+DisclosingDest(i, fn, v) :-
+    DestValue(i, fn, v),
+    UrlSinkField(fn),
+    @url_carries_data(v) = 1.
+
+/* ── Consent ────────────────────────────────────────────────────── */
+
+// Per-kind consent. "Delete the largest file" says nothing about whether the
+// user wanted a password changed, so it must not authorise one. This reads the
+// user's *request* only, never anything the agent read, so widening it can
+// recover legitimate work but cannot admit an injection.
+.decl ConsentGivenFor(kind: symbol)
+.output ConsentGivenFor
+ConsentGivenFor(k) :-
+    EffectKind(_, k),
+    UserRequest(q),
+    @requests_effect_kind(q, k) = 1.
+
+.decl ValueCameFromUser(idx: unsigned, fn: symbol, v: symbol)
+ValueCameFromUser(i, fn, v) :-
+    Actions(i, a),
+    a = $CallTool(fn, args),
+    ValueFromUser(fn, f),
+    v = @json_get_str(args, f),
+    v != "",
+    UserRequest(q),
+    @contains_identifier(q, v) = 1.
+
+.decl ValueRequiredFromUser(idx: unsigned, fn: symbol, v: symbol)
+ValueRequiredFromUser(i, fn, v) :-
+    Actions(i, a),
+    a = $CallTool(fn, args),
+    ValueFromUser(fn, f),
+    v = @json_get_str(args, f),
+    v != "".
+
+// The browse exception (B): a fetch the USER asked for, to a URL that cannot
+// carry anything out, is allowed even though the URL itself came from content
+// the agent read.
+//
+// Two different provenance questions and a value property, conjoined:
+//   - the INTENT came from a trusted source (the user's own request asks to
+//     read a page — the same per-kind consent the intent rule uses);
+//   - the VALUE cannot disclose (no query, fragment or userinfo), so nothing
+//     the agent holds can ride along;
+//   - and the content that comes back is untrusted either way, which the taint
+//     rules already handle.
+//
+// What it gives up is stated rather than hidden: an injection that says "visit
+// this link" succeeds, on tasks where the user asked to read pages. That is a
+// visit and not a disclosure, and it is a deliberate trade — hence a switch.
+.decl BrowseAllowed(idx: unsigned, v: symbol)
+BrowseAllowed(i, v) :-
+    BrowseException(),
+    Actions(i, a),
+    a = $CallTool(fn, _),
+    // The tool must be a READ. Keying on `UrlSinkField` alone was wrong and
+    // opened an exfiltration path: `post_webpage` is a URL sink too, so the
+    // exception excused a call that WRITES content to a site. For a fetch the
+    // URL is the whole request, and a URL that cannot carry data discloses
+    // nothing; for a post the payload is the `content` argument and the URL's
+    // shape says nothing about it.
+    EffectKind(fn, "browse"),
+    UrlSinkField(fn),
+    DestValue(i, fn, v),
+    @url_carries_data(v) = 0,
+    ConsentGivenFor("browse").
+
+/* ── Authorization ──────────────────────────────────────────────── */
+
+// Reads and anything outside the taxonomy pass; the denial rules below
+// carve out the calls that matter.
+//
+// NOTE ON ANNOTATIONS. `sugar.py` binds a contiguous comment run to the ONE
+// rule that follows it, and keeps only the LAST @deny_message in that run. So
+// every rule that needs its own message must have its own block, separated by a
+// blank line from the one before. Getting this wrong is silent: the rule still
+// fires, and the model is told "Action is denylisted" with no suggestion, which
+// is the one thing it cannot act on.
+IsAuthorized(idx) :- Actions(idx, a), IsToolCall(a).
+IsAuthorized(idx) :- Actions(idx, a), !IsToolCall(a).
+
+// Rule TA — trusted action, the IFC arm. No sink fires while the context
+// carries anything untrusted, whatever its arguments say. This is the policy
+// class the published IFC defenses enforce — a label-conditioned tool
+// allowlist — expressed here so the two can be compared on one agent, one
+// attack and one harness, with only the policy differing. Argument provenance
+// is exactly what this gives up: it cannot be laundered, and it cannot let the
+// user delegate a destination to a document either. The intent rule and rule
+// 5 stand down in this mode, so the arm is the allowlist and not that plus
+// rules the comparison is not about.
+// @deny_message: This call would act on a context that contains content from an outside source.
+// @suggestion: Start a fresh session, or complete the task without reading outside content first.
+Unauthorized(idx) :-
+    StrictTaint(),
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    Sink(fn),
+    CurrentTainted().
+
+// Rule F — permitted flow, the confidentiality half.
+//
+// Trusted action on its own is an INTEGRITY rule: it asks whether anything the
+// agent read could have been written by an outsider. It says nothing about
+// where the user's own data goes, so an agent that has read only trustworthy
+// things is free to send them anywhere. This is the other half: once the user's
+// data is in context, a sink may only act on a destination the operator already
+// knows — its own domain, its directory, or one the user named.
+//
+// It fires independently of taint, which is what makes it worth having: it
+// refuses a disclosure even when no injection is present at all.
+//
+// The exception is `Anchored`: a disclosure the user's own request determines
+// — "email this to my accountant at <address>" — is permitted, and one that
+// only the environment determines is not. What it cannot express is a request
+// that names an intent without naming a destination.
+// @deny_message: This call would send the user's own data to a destination outside the ones the operator knows.
+// @suggestion: Send it to an address inside the organisation, or one the user named in their request.
+Unauthorized(idx) :-
+    Confidentiality(),
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    Sink(fn),
+    CurrentConfidential(),
+    DisclosingDest(idx, fn, v),
+    !Anchored(v).
+
+// Rule W — the content of the call was DICTATED by an outsider: is this field
+// the outsider's text rather than something the agent composed for the user?
+//
+// It exists because intent and target checks both miss the case. An injection
+// that says "create a calendar event titled X" is refused for naming no
+// destination — until the agent, told exactly that, adds the user's own address
+// as a participant and the same event goes through. The target rule cannot help
+// either: a calendar event's real target is its title and time, and the
+// attacker writes both, so asking about the participant asks the wrong question
+// and answers it "yes". What does not change under any of that reformulation is
+// that the title is the attacker's words, verbatim.
+//
+// The `!Anchored(v)` exemption is narrow. Anchored is only ever derived for
+// destination values, body identifiers and response entities, so it applies
+// only when the dictated field's whole value is one of those — a URL field
+// declared through `dictated_field`, say. For a free-text body field it never
+// applies.
+//
+// Dates are a field of their own kind. Booking tools take an ISO date, which
+// the agent writes itself from prose: an injection that says "reserve it from
+// the 1st to the 5th of May 2024" never shows the value `2024-05-01` verbatim,
+// and a date is shorter than the floor that keeps coincidences out of the
+// verbatim test. So for a value that is an ISO date and nothing else (a time
+// of day may follow) the question is whether an outsider's
+// text NAMES that day, and the exemption is `DateFromUser`: the user's own
+// request names it too. What the date reading does not see — numeric dates
+// such as 05/01/2024, dates in words, relative dates like "next Friday" — is a
+// dictation this rule misses, not one it refuses. The exemption has the same
+// reading and the same blind spots: it asks whether the request NAMES the day,
+// not what it says about it ("do not start on the 15th" names the 15th), and
+// a user date it cannot read exempts nothing. The time of day is not compared.
+// @deny_message: The text of this call was taken from content the agent read rather than composed for your request.
+// @suggestion: Re-issue the call with the wording you want, or confirm the text is what you asked for.
+Unauthorized(idx) :-
+    DictatedContent(),
+    Actions(idx, a),
+    a = $CallTool(fn, args),
+    Sink(fn),
+    DictatedField(fn, f),
+    v = @json_get_str(args, f),
+    v != "",
+    UntrustedText(t),
+    OwnDomainList(ds),
+    OwnPrincipalList(ps),
+    @is_dictated_by_outsider(t, v, ds, ps) = 1,
+    !Anchored(v),
+    !DateFromUser(v).
+
+// A value of a dictated field that names a day the user's own request names.
+// Bound over the calls actually being checked, so the date reading runs once
+// per candidate value rather than over every string in the graph.
+.decl DateFromUser(v: symbol)
+DateFromUser(v) :-
+    DictatedContent(),
+    Actions(_, a),
+    a = $CallTool(fn, args),
+    Sink(fn),
+    DictatedField(fn, f),
+    v = @json_get_str(args, f),
+    v != "",
+    UserRequest(q),
+    @mentions_date(q, v) = 1.
+
+// Rule T — the target must be the one the USER identified, not merely one of
+// the right kind.
+//
+// The intent rule answers "did the user want a delete?" when the question that
+// matters is "did the user want THIS delete?". So a target is authorised two
+// ways, and only two: the user named it, or the user named a criterion the
+// listing settles and this is what it selects. A call whose target is neither
+// is refused even though its kind was requested.
+//
+// Rule S is not redundant with this: T accepts a target that the criterion
+// selects in SOME listing in the slice, while S refuses one that differs from
+// the selection in ANY of them, which catches a re-listing or a narrowed search
+// that makes the attacker's item the winner. Here, unlike S, the ABSENCE of an
+// identification is itself disqualifying.
+.decl TargetValue(idx: unsigned, fn: symbol, v: symbol)
+TargetValue(i, fn, v) :-
+    SelectionTarget(fn, arg),
+    Actions(i, a),
+    a = $CallTool(fn, args),
+    v = @json_get_str(args, arg),
+    v != "".
+TargetValue(i, fn, v) :- DestValue(i, fn, v), EffectKind(fn, _).
+
+.decl TargetAuthorised(idx: unsigned)
+.output TargetAuthorised
+// The user named the target outright.
+TargetAuthorised(i) :- TargetValue(i, _, v), StronglyAnchored(v).
+// Or named a criterion, and this is the record it selects.
+TargetAuthorised(i) :-
+    TargetValue(i, fn, v),
+    UserRequest(q),
+    cls = @criterion_class(q),
+    cls != "",
+    SelectionField(fn, cls, vfield),
+    SelectionIdField(fn, idf),
+    ListingText(t),
+    v = @selected_id(t, idf, vfield, @criterion_wants_max(q)).
+
+// @deny_message: Your request asks for an effect of this kind but does not identify this particular target.
+// @suggestion: Name the item you meant, or restate the criterion that picks it out.
+Unauthorized(idx) :-
+    StrictConsent(),
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    EffectKind(fn, k),
+    !TargetExemptKind(k),
+    TargetValue(idx, fn, _),
+    !TargetAuthorised(idx).
+
+// Rule S — the agent chose something the user's own criterion does not select.
+//
+// This checks WHAT WAS CHOSEN rather than where a value came from, because
+// provenance cannot do the job here. "Delete the largest file" names a
+// criterion, not an id, so the id must come from the listing the agent read —
+// the user's file and an attacker's arrive by the same route and no provenance
+// rule separates them.
+//
+// The criterion, though, is the user's own words, and the listing carries the
+// numbers. So the policy recomputes the answer and requires the argument to
+// match. Nothing untrusted is BELIEVED: the listing supplies candidate rows and
+// the arithmetic is the policy's own, exactly as a directory supplies candidate
+// destinations elsewhere.
+//
+// It stands down unless the request names a criterion the listing can settle —
+// "the file about recipes" is semantic and gets nothing here. This verifies a
+// selection; it does not infer an intent.
+// @deny_message: This call acts on something other than what your request selects.
+// @suggestion: Re-issue the call naming the item you meant, or restate the criterion.
+Unauthorized(idx) :-
+    SelectionCheck(),
+    Actions(idx, a),
+    a = $CallTool(fn, args),
+    SelectionTarget(fn, argname),
+    v = @json_get_str(args, argname),
+    v != "",
+    UserRequest(q),
+    cls = @criterion_class(q),
+    cls != "",
+    SelectionField(fn, cls, vfield),
+    SelectionIdField(fn, idf),
+    ListingText(t),
+    sel = @selected_id(t, idf, vfield, @criterion_wants_max(q)),
+    sel != "",
+    sel != v.
+
+// Rule K — a consequential KIND of value with no strong provenance.
+//
+// An account number must have come from the user or from the bank's own
+// records. Not from a document the agent read, and not merely from some
+// trusted tool having mentioned it. It is a condition on what the ARGUMENT IS,
+// joined against where that particular value came from, and it holds whether
+// or not the surrounding context is tainted — which a policy comparing the
+// call's label to a permitted label has nowhere to put.
+// @deny_message: This call would move money to an account number that appears only in content the agent read, not in your request or our records.
+// @suggestion: Re-issue the call with the account number written out in your own request.
+Unauthorized(idx) :-
+    AccountProvenance(),
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    Sink(fn),
+    DestValue(idx, fn, v),
+    @is_account_number(v) = 1,
+    !StronglyAnchored(v).
+
+// Rule 2c — a sink fired while tainted that carries NO destination at all.
+//
+// Rules 1+2, 2b and F all bind a `DestValue`. A sink whose declared destination
+// fields are simply absent from the call therefore matches none of them and
+// passes untouched, however tainted the context. The policy cannot claim a
+// destination is anchored when the call names no destination — the argument
+// rule 2b makes about a list too long to walk, applied to a list of length
+// zero. `create_calendar_event` with a title and no participants is the case:
+// an attacker-chosen event on the user's own calendar.
+// @deny_message: This call changes something while the context contains outside content, and names no destination the policy can check.
+// @suggestion: Re-issue the call naming who it is for, or complete it before reading outside content.
+Unauthorized(idx) :-
+    GateUnanchorable(),
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    Sink(fn),
+    DestinationField(fn, _),
+    CurrentTainted(),
+    !HasDestValue(idx).
+
+// Rule 1+2 — a sink acting on a destination nobody vouched for.
+// @deny_message: This call would send the effect to a destination that appears only in content the agent read from an outside source.
+// @suggestion: Ask the user to confirm the destination, or re-issue the call with a destination the user named.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    Sink(fn),
+    CurrentTainted(),
+    DestValue(idx, fn, v),
+    !Anchored(v),
+    !BrowseAllowed(idx, v).
+
+// Rule 2b — more destinations or identifiers than the bounded walk can reach.
+// `Idx` stops at 32, so a list whose tail is never examined is a list an
+// attacker appends the payload to. Refusing is the only sound answer: the
+// policy cannot claim a value is anchored if it never looked at it.
+// @deny_message: This call carries more recipients or links than the policy can check individually.
+// @suggestion: Split the call into smaller ones so each destination can be checked.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    a = $CallTool(fn, args),
+    Sink(fn),
+    CurrentTainted(),
+    DestinationField(fn, f),
+    @json_array_len(args, f) > 32.
+// @deny_message: This message carries more addresses or links than the policy can check individually.
+// @suggestion: Split the message so each identifier in it can be checked.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    a = $CallTool(fn, args),
+    Sink(fn),
+    CurrentTainted(),
+    BodyField(fn, f),
+    @identifier_count(@json_get_str(args, f)) > 32.
+// @deny_message: This answer names more businesses than the policy can check individually.
+// @suggestion: Shorten the answer so each name in it can be checked.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    a = $CallTool(fn, args),
+    ResponseTool(fn),
+    EntitySuffixes(sfxs),
+    @catalog_entity_count(@json_get_str(args, "text"), sfxs) > 32.
+
+// Rule 3 — an identifier laundered into the body of an outbound message.
+// @deny_message: The message body carries an address or link that came only from untrusted content.
+// @suggestion: Remove the address or link, or confirm it with the user before sending.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    Sink(fn),
+    CurrentTainted(),
+    BodyIdent(idx, fn, v),
+    !Anchored(v).
+
+// Rule I — intent. A sink with a declared effect kind requires the user to have
+// asked for an effect of that kind, whether or not the effect is irreversible.
+// Booking a room is not destructive, but it is still the user's to want, and an
+// agent that was asked for a restaurant has no mandate to reserve a hotel.
+//
+// Sinks only: a tool that is not a sink changes nothing, so there is no effect
+// to consent to. `get_webpage` carries the kind `browse` in every
+// configuration, but it is a sink only under the fetch gate; without the gate
+// a page read is ungated, as every other read is.
+//
+// This is a consent question, not a task-consistency one: it asks whether the
+// KIND was requested, never whether this particular business was the right
+// choice. Off in trusted-action mode (see rule TA).
+// @deny_message: This call produces an effect of a kind the user's request does not ask for.
+// @suggestion: Confirm with the user before booking or changing anything they did not ask for.
+Unauthorized(idx) :-
+    !StrictTaint(),
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    Sink(fn),
+    EffectKind(fn, k),
+    !ConsentGivenFor(k).
+
+// Rule 5 — the answer promotes something nobody vouched for.
+// An injection does not have to reach a tool to succeed. It can simply get the
+// agent to recommend a business in its reply, and no amount of gating tool
+// calls will see that. The answer is checked with the same anchoring rule the
+// destinations use: a catalogued type of entity that the catalogue does not
+// list, and that the user never mentioned, came from content the agent read.
+// @deny_message: The answer puts forward a business that the user did not mention and that our records do not list.
+// @suggestion: Remove the recommendation, or confirm the business exists in the catalogue before naming it.
+Unauthorized(idx) :-
+    !StrictTaint(),
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    ResponseTool(fn),
+    ResponseEntity(idx, e),
+    !Anchored(e).
+
+// Rule 4b — a new credential that did not come from the user.
+// @deny_message: This call sets a value that does not appear in the user's request.
+// @suggestion: Only set credentials the user supplied directly.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    ValueRequiredFromUser(idx, fn, v),
+    !ValueCameFromUser(idx, fn, v).

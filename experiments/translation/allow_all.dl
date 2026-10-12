@@ -1,0 +1,13 @@
+/* Allow-all capture policy.
+
+   Authorizes every action and never denies. Used by the
+   translation loop to record natural (unblocked) agent traces:
+   pin it per session via SASY_POLICY_PATH (or
+   sasy.session(policy=...)) with SASY_CAPTURE_FILE set, then
+   convert the captured decision points into test scenarios with
+   experiments/translation/capture_to_scenarios.py.
+
+   NOT for production use. */
+#include "../../sasy/souffle/common_policy.dl"
+
+IsAuthorized(idx) :- Actions(idx, _).

@@ -1,0 +1,58 @@
+/* Toxic Flow Detection Policy (Soufflé) — prompt injection defense */
+
+// Custom functor: maps file paths to security levels
+.functor file_security_level(path: symbol): number stateful
+
+/* Heavy-IDB gating opt-in (see common_policy.dl). The taint chain
+   below is only consumed by the send_email denial rule, so only
+   send_email needs the backward slice. read_file and list_files
+   observe themselves via ToolResult past-tense and don't need
+   CurrentDepends to be computed. */
+CurrentDependsPolicyRelevant() :- IsTool(_, "send_email").
+
+/* Taint Tracking: Untrusted Sources */
+
+.decl CurrentTaintedByUntrusted(src: symbol)
+.output CurrentTaintedByUntrusted
+
+// Base: untrusted file read in the backward slice
+CurrentTaintedByUntrusted(src) :-
+    CurrentDepends(src),
+    ToolResult(src, "read_file", args),
+    @json_get_str(args, "path") = "/documents/internal/xyz_disclosures.txt".
+
+/* Taint Tracking: Sensitive Data */
+
+.decl CurrentAccessesSensitive(src: symbol)
+.output CurrentAccessesSensitive
+
+// Base: SECRET or TOP_SECRET file read in the backward slice
+// file_security_level: /secret/ → 3, /restricted/ → 2, /internal/ → 1, else 0
+CurrentAccessesSensitive(src) :-
+    CurrentDepends(src),
+    ToolResult(src, "read_file", args),
+    @file_security_level(@json_get_str(args, "path")) >= 2.
+
+/* Combined Taint: current node depends on both untrusted AND sensitive */
+
+.decl CurrentHasToxicTaint()
+CurrentHasToxicTaint() :- CurrentTaintedByUntrusted(_), CurrentAccessesSensitive(_).
+
+/* Authorization */
+
+IsAuthorized(idx) :- Actions(idx, a), IsToolCall(a).
+
+// @deny_message: Blocked: Action would exfiltrate sensitive data influenced by untrusted input
+// @suggestion: This action depends on both external/untrusted data and sensitive user data.
+// @tool_pattern: send_email
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "send_email"),
+    CurrentHasToxicTaint(),
+    a = $CallTool(_, args),
+    @str_contains(@json_get_str(args, "to"), "@acme.com") != 1.
+
+IsAuthorized(idx) :- Actions(idx, a), !IsToolCall(a), !QueriesHost(a, "api.openai.com").
+IsAuthorized(idx) :- Actions(idx, a), QueriesHost(a, "api.openai.com"), HasRole("openai-access").
+
+ApplyTransform(idx, "inject_openai_key") :- Actions(idx, a), QueriesHost(a, "api.openai.com"), Authorized(idx).

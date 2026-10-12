@@ -1,0 +1,33 @@
+[project]
+name = "forge-tau2"
+version = "0.0.1"
+description = "Tau2 benchmark examples with policy enforcement"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "tau2",
+    "sasy",
+    "python-dotenv>=1.0.0",
+    "google-cloud-aiplatform>=1.132.0",
+    # Match tau2 v1.0.1's litellm range; those litellm releases need openai>=2.8.
+    # forge_tau2.litellm_patches is written against this range.
+    "litellm>=1.80.15,<1.82.7",
+    "openai>=2.8",
+]
+
+[project.scripts]
+tau2-instrumented = "forge_tau2.cli:run"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["forge_tau2"]
+
+[tool.uv.sources]
+sasy = { workspace = true }
+tau2 = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

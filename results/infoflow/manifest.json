@@ -1,0 +1,277 @@
+{
+  "timestamp": "2026-10-03T23-31-30",
+  "run_dir": ".",
+  "targets": [
+    "infoflow"
+  ],
+  "domains": [
+    "airline",
+    "retail"
+  ],
+  "modes": [
+    "enforce-off",
+    "enforce-on"
+  ],
+  "models": [
+    "opus",
+    "gpt",
+    "gemini"
+  ],
+  "model_strings": {
+    "opus": "vertex_ai/claude-opus-4-5@20251101",
+    "gpt": "azure/gpt-5.2",
+    "gemini": "vertex_ai/gemini-3.1-pro-preview"
+  },
+  "user_llm": "azure/gpt-5.2",
+  "num_trials": 4,
+  "max_concurrency": 32,
+  "task_ids": "all",
+  "nl_judge_model": "vertex_ai/claude-opus-4-5@20251101",
+  "agentdojo": {
+    "provider": "azure",
+    "deployment": "gpt-4o",
+    "model_label": "gpt-4o-2024-08-06",
+    "attack": "tool_knowledge",
+    "version": "v1.2.2",
+    "presets": [
+      "none",
+      "none-rep",
+      "tool-filter",
+      "tool-filter-rep",
+      "ifc",
+      "ifc-rep",
+      "provenance",
+      "provenance-rep"
+    ],
+    "repeats": 5,
+    "threads": 32,
+    "suites": "all",
+    "user_tasks": "all",
+    "injection_tasks": "all",
+    "logdir": "agentdojo/runs"
+  },
+  "example_num_trials": 5,
+  "example_max_concurrency": 5,
+  "retry_infrastructure_errors": false,
+  "start_server": true,
+  "backend": {
+    "data_dir": "server-data",
+    "url": "localhost:11089",
+    "binary": "<implementation>/target/release/sasy"
+  },
+  "latency_capture": {
+    "version": 1,
+    "enabled": true,
+    "server_log": "server_latency.jsonl",
+    "graph_state": "persisted-at-stop",
+    "state": "stopped",
+    "engine_sha256": "ca43e79541a86103ceba3f788aeb5ee8f057c15e29fceaba4b27fe5ba3071e0f"
+  },
+  "warmups": [],
+  "cells": [
+    {
+      "id": "infoflow/toxic_instr",
+      "target": "infoflow",
+      "name": "toxic",
+      "instrumented": true,
+      "policy": "examples/information-flow/toxic_flow_policy.dl",
+      "cert": "developer",
+      "command": [
+        "uv",
+        "run",
+        "python",
+        "examples/information-flow/information_flow/main.py",
+        "--model",
+        "gpt-4.1-mini",
+        "--azure",
+        "True",
+        "--instrumented",
+        "True",
+        "--nl_policy",
+        "False",
+        "--llm_judge",
+        "False",
+        "--trials",
+        "5",
+        "--max_concurrency",
+        "5",
+        "--concurrency_mode",
+        "processes",
+        "--policy_label",
+        "Toxic Flow",
+        "--clearance_label",
+        "",
+        "--output_dir",
+        "infoflow_toxic_instr",
+        "--suffix",
+        "infoflow_toxic_instr",
+        "--env_credentials",
+        "True"
+      ],
+      "env": {
+        "TLS_CERT_PATH": "<local-path>",
+        "TLS_KEY_PATH": "<local-path>"
+      },
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 42.9,
+      "sim_path": "infoflow_toxic_instr/results-gpt-4-1-mini-toxic-flow-infoflow_toxic_instr.json",
+      "sim_relpath": "infoflow_toxic_instr/results-gpt-4-1-mini-toxic-flow-infoflow_toxic_instr.json"
+    },
+    {
+      "id": "infoflow/mls-jsmith_instr",
+      "target": "infoflow",
+      "name": "mls-jsmith",
+      "instrumented": true,
+      "policy": "examples/information-flow/mls_policy.dl",
+      "cert": "jsmith",
+      "command": [
+        "uv",
+        "run",
+        "python",
+        "examples/information-flow/information_flow/main.py",
+        "--model",
+        "gpt-4.1-mini",
+        "--azure",
+        "True",
+        "--instrumented",
+        "True",
+        "--nl_policy",
+        "False",
+        "--llm_judge",
+        "False",
+        "--trials",
+        "5",
+        "--max_concurrency",
+        "5",
+        "--concurrency_mode",
+        "processes",
+        "--policy_label",
+        "MLS",
+        "--clearance_label",
+        "TOP_SECRET",
+        "--output_dir",
+        "infoflow_mls-jsmith_instr",
+        "--suffix",
+        "infoflow_mls-jsmith_instr",
+        "--env_credentials",
+        "True"
+      ],
+      "env": {
+        "TLS_CERT_PATH": "<local-path>",
+        "TLS_KEY_PATH": "<local-path>"
+      },
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 33.8,
+      "sim_path": "infoflow_mls-jsmith_instr/results-gpt-4-1-mini-mls-top_secret-infoflow_mls-jsmith_instr.json",
+      "sim_relpath": "infoflow_mls-jsmith_instr/results-gpt-4-1-mini-mls-top_secret-infoflow_mls-jsmith_instr.json"
+    },
+    {
+      "id": "infoflow/mls-achen_instr",
+      "target": "infoflow",
+      "name": "mls-achen",
+      "instrumented": true,
+      "policy": "examples/information-flow/mls_policy.dl",
+      "cert": "achen",
+      "command": [
+        "uv",
+        "run",
+        "python",
+        "examples/information-flow/information_flow/main.py",
+        "--model",
+        "gpt-4.1-mini",
+        "--azure",
+        "True",
+        "--instrumented",
+        "True",
+        "--nl_policy",
+        "False",
+        "--llm_judge",
+        "False",
+        "--trials",
+        "5",
+        "--max_concurrency",
+        "5",
+        "--concurrency_mode",
+        "processes",
+        "--policy_label",
+        "MLS",
+        "--clearance_label",
+        "SECRET",
+        "--output_dir",
+        "infoflow_mls-achen_instr",
+        "--suffix",
+        "infoflow_mls-achen_instr",
+        "--env_credentials",
+        "True"
+      ],
+      "env": {
+        "TLS_CERT_PATH": "<local-path>",
+        "TLS_KEY_PATH": "<local-path>"
+      },
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 26.2,
+      "sim_path": "infoflow_mls-achen_instr/results-gpt-4-1-mini-mls-secret-infoflow_mls-achen_instr.json",
+      "sim_relpath": "infoflow_mls-achen_instr/results-gpt-4-1-mini-mls-secret-infoflow_mls-achen_instr.json"
+    },
+    {
+      "id": "infoflow/nl_nl",
+      "target": "infoflow",
+      "name": "nl",
+      "instrumented": false,
+      "policy": null,
+      "cert": "developer",
+      "command": [
+        "uv",
+        "run",
+        "python",
+        "examples/information-flow/information_flow/main.py",
+        "--model",
+        "gpt-4.1-mini",
+        "--azure",
+        "True",
+        "--instrumented",
+        "False",
+        "--nl_policy",
+        "True",
+        "--llm_judge",
+        "False",
+        "--trials",
+        "5",
+        "--max_concurrency",
+        "5",
+        "--concurrency_mode",
+        "processes",
+        "--policy_label",
+        "NL Prompt",
+        "--clearance_label",
+        "",
+        "--output_dir",
+        "infoflow_nl_nl",
+        "--suffix",
+        "infoflow_nl_nl",
+        "--env_credentials",
+        "True"
+      ],
+      "env": {
+        "TLS_CERT_PATH": "<local-path>",
+        "TLS_KEY_PATH": "<local-path>"
+      },
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 17.4,
+      "sim_path": "infoflow_nl_nl/results-gpt-4-1-mini-nl-prompt-infoflow_nl_nl.json",
+      "sim_relpath": "infoflow_nl_nl/results-gpt-4-1-mini-nl-prompt-infoflow_nl_nl.json"
+    }
+  ]
+}

@@ -1,0 +1,467 @@
+{
+  "timestamp": "2026-10-04T18-20-59",
+  "run_dir": ".",
+  "targets": [
+    "agentdojo"
+  ],
+  "domains": [
+    "airline",
+    "retail"
+  ],
+  "modes": [
+    "enforce-off",
+    "enforce-on"
+  ],
+  "models": [
+    "opus",
+    "gpt",
+    "gemini"
+  ],
+  "model_strings": {
+    "opus": "vertex_ai/claude-opus-4-5@20251101",
+    "gpt": "azure/gpt-5.2",
+    "gemini": "vertex_ai/gemini-3.1-pro-preview"
+  },
+  "user_llm": "azure/gpt-5.2",
+  "num_trials": 4,
+  "max_concurrency": 32,
+  "task_ids": "all",
+  "nl_judge_model": "vertex_ai/claude-opus-4-5@20251101",
+  "agentdojo": {
+    "provider": "azure",
+    "deployment": "gpt-4o",
+    "model_label": "gpt-4o-2024-08-06",
+    "attack": "tool_knowledge",
+    "version": "v1.2.2",
+    "presets": [
+      "none",
+      "none-rep",
+      "tool-filter",
+      "tool-filter-rep",
+      "ifc",
+      "ifc-rep",
+      "provenance",
+      "provenance-rep"
+    ],
+    "repeats": 5,
+    "threads": 32,
+    "suites": "all",
+    "user_tasks": "all",
+    "injection_tasks": "all",
+    "logdir": "agentdojo/runs"
+  },
+  "example_num_trials": 5,
+  "example_max_concurrency": 5,
+  "retry_infrastructure_errors": false,
+  "start_server": true,
+  "backend": {
+    "data_dir": "server-data",
+    "url": "localhost:11089",
+    "binary": "<implementation>/target/release/sasy"
+  },
+  "latency_capture": {
+    "version": 1,
+    "enabled": true,
+    "server_log": "server_latency.jsonl",
+    "graph_state": "persisted-at-stop",
+    "state": "stopped",
+    "engine_sha256": "ca43e79541a86103ceba3f788aeb5ee8f057c15e29fceaba4b27fe5ba3071e0f"
+  },
+  "warmups": [
+    {
+      "id": "warmup/agentdojo/ifc",
+      "target": "agentdojo",
+      "preset": "ifc",
+      "tag": "P-fides",
+      "row": "Information flow control policy",
+      "arm": "sasy",
+      "defense": null,
+      "switches": [
+        "strict_taint"
+      ],
+      "repeat_user_prompt": false,
+      "repeats": 1,
+      "logdir": "warmup/agentdojo",
+      "suites": [
+        "workspace"
+      ],
+      "user_tasks": [
+        "user_task_0"
+      ],
+      "injection_tasks": [],
+      "command": [
+        "<repository>/experiments/agentdojo/.venv/bin/python",
+        "<repository>/experiments/agentdojo/run.py",
+        "--preset",
+        "ifc",
+        "--attack",
+        "none",
+        "--suite",
+        "workspace",
+        "--user-task",
+        "user_task_0",
+        "--repeats",
+        "1",
+        "--threads",
+        "1",
+        "--logdir",
+        "warmup/agentdojo"
+      ],
+      "env": {},
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "warms": "examples/agentdojo/policies/agentdojo_policy.dl",
+      "returncode": 0,
+      "wall_s": 17.0,
+      "results_path": "warmup/agentdojo",
+      "results_relpath": "warmup/agentdojo"
+    }
+  ],
+  "cells": [
+    {
+      "id": "agentdojo/none",
+      "target": "agentdojo",
+      "preset": "none",
+      "tag": "N-none",
+      "row": "No runtime defense",
+      "arm": "baseline",
+      "defense": null,
+      "switches": [],
+      "repeat_user_prompt": false,
+      "repeats": 5,
+      "logdir": "agentdojo/runs",
+      "suites": "all",
+      "user_tasks": "all",
+      "injection_tasks": "all",
+      "command": [
+        "<repository>/experiments/agentdojo/.venv/bin/python",
+        "<repository>/experiments/agentdojo/run.py",
+        "--preset",
+        "none",
+        "--repeats",
+        "5",
+        "--threads",
+        "32",
+        "--logdir",
+        "agentdojo/runs"
+      ],
+      "env": {},
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 862.5,
+      "results_path": "agentdojo/runs/gpt-4o-2024-08-06-N-none-r<1..5>-baseline",
+      "results_relpath": "agentdojo/runs/gpt-4o-2024-08-06-N-none-r<1..5>-baseline"
+    },
+    {
+      "id": "agentdojo/none-rep",
+      "target": "agentdojo",
+      "preset": "none-rep",
+      "tag": "N-none-rep",
+      "row": "No runtime defense",
+      "arm": "baseline",
+      "defense": "repeat_user_prompt",
+      "switches": [],
+      "repeat_user_prompt": false,
+      "repeats": 5,
+      "logdir": "agentdojo/runs",
+      "suites": "all",
+      "user_tasks": "all",
+      "injection_tasks": "all",
+      "previous_attempt": {
+        "id": "agentdojo/none-rep",
+        "target": "agentdojo",
+        "preset": "none-rep",
+        "tag": "N-none-rep",
+        "row": "No runtime defense",
+        "arm": "baseline",
+        "defense": "repeat_user_prompt",
+        "switches": [],
+        "repeat_user_prompt": false,
+        "repeats": 5,
+        "logdir": "agentdojo/runs",
+        "suites": "all",
+        "user_tasks": "all",
+        "injection_tasks": "all",
+        "command": [
+          "<repository>/experiments/agentdojo/.venv/bin/python",
+          "<repository>/experiments/agentdojo/run.py",
+          "--preset",
+          "none-rep",
+          "--repeats",
+          "5",
+          "--threads",
+          "32",
+          "--logdir",
+          "agentdojo/runs"
+        ],
+        "env": {},
+        "unset": [
+          "SASY_POLICY_PATH"
+        ],
+        "returncode": 1,
+        "wall_s": 1612.8,
+        "results_path": "agentdojo/runs/gpt-4o-2024-08-06-N-none-rep-r<1..5>-repeat_user_prompt",
+        "results_relpath": "agentdojo/runs/gpt-4o-2024-08-06-N-none-rep-r<1..5>-repeat_user_prompt"
+      },
+      "command": [
+        "<repository>/experiments/agentdojo/.venv/bin/python",
+        "<repository>/experiments/agentdojo/run.py",
+        "--preset",
+        "none-rep",
+        "--repeats",
+        "5",
+        "--threads",
+        "32",
+        "--logdir",
+        "agentdojo/runs"
+      ],
+      "env": {},
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 238.0,
+      "results_path": "agentdojo/runs/gpt-4o-2024-08-06-N-none-rep-r<1..5>-repeat_user_prompt",
+      "results_relpath": "agentdojo/runs/gpt-4o-2024-08-06-N-none-rep-r<1..5>-repeat_user_prompt"
+    },
+    {
+      "id": "agentdojo/tool-filter",
+      "target": "agentdojo",
+      "preset": "tool-filter",
+      "tag": "N-tf",
+      "row": "Tool-call filter",
+      "arm": "baseline",
+      "defense": "tool_filter",
+      "switches": [],
+      "repeat_user_prompt": false,
+      "repeats": 5,
+      "logdir": "agentdojo/runs",
+      "suites": "all",
+      "user_tasks": "all",
+      "injection_tasks": "all",
+      "command": [
+        "<repository>/experiments/agentdojo/.venv/bin/python",
+        "<repository>/experiments/agentdojo/run.py",
+        "--preset",
+        "tool-filter",
+        "--repeats",
+        "5",
+        "--threads",
+        "32",
+        "--logdir",
+        "agentdojo/runs"
+      ],
+      "env": {},
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 949.1,
+      "results_path": "agentdojo/runs/gpt-4o-2024-08-06-N-tf-r<1..5>-tool_filter",
+      "results_relpath": "agentdojo/runs/gpt-4o-2024-08-06-N-tf-r<1..5>-tool_filter"
+    },
+    {
+      "id": "agentdojo/tool-filter-rep",
+      "target": "agentdojo",
+      "preset": "tool-filter-rep",
+      "tag": "N-tf-rep",
+      "row": "Tool-call filter",
+      "arm": "baseline",
+      "defense": "tool_filter+repeat_user_prompt",
+      "switches": [],
+      "repeat_user_prompt": false,
+      "repeats": 5,
+      "logdir": "agentdojo/runs",
+      "suites": "all",
+      "user_tasks": "all",
+      "injection_tasks": "all",
+      "command": [
+        "<repository>/experiments/agentdojo/.venv/bin/python",
+        "<repository>/experiments/agentdojo/run.py",
+        "--preset",
+        "tool-filter-rep",
+        "--repeats",
+        "5",
+        "--threads",
+        "32",
+        "--logdir",
+        "agentdojo/runs"
+      ],
+      "env": {},
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 1275.7,
+      "results_path": "agentdojo/runs/gpt-4o-2024-08-06-N-tf-rep-r<1..5>-tool_filter+repeat_user_prompt",
+      "results_relpath": "agentdojo/runs/gpt-4o-2024-08-06-N-tf-rep-r<1..5>-tool_filter+repeat_user_prompt"
+    },
+    {
+      "id": "agentdojo/ifc",
+      "target": "agentdojo",
+      "preset": "ifc",
+      "tag": "P-fides",
+      "row": "Information flow control policy",
+      "arm": "sasy",
+      "defense": null,
+      "switches": [
+        "strict_taint"
+      ],
+      "repeat_user_prompt": false,
+      "repeats": 5,
+      "logdir": "agentdojo/runs",
+      "suites": "all",
+      "user_tasks": "all",
+      "injection_tasks": "all",
+      "command": [
+        "<repository>/experiments/agentdojo/.venv/bin/python",
+        "<repository>/experiments/agentdojo/run.py",
+        "--preset",
+        "ifc",
+        "--repeats",
+        "5",
+        "--threads",
+        "32",
+        "--logdir",
+        "agentdojo/runs"
+      ],
+      "env": {},
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 1157.4,
+      "results_path": "agentdojo/runs/gpt-4o-2024-08-06-P-fides-r<1..5>-sasy",
+      "results_relpath": "agentdojo/runs/gpt-4o-2024-08-06-P-fides-r<1..5>-sasy"
+    },
+    {
+      "id": "agentdojo/ifc-rep",
+      "target": "agentdojo",
+      "preset": "ifc-rep",
+      "tag": "P-fides-rep",
+      "row": "Information flow control policy",
+      "arm": "sasy",
+      "defense": null,
+      "switches": [
+        "strict_taint"
+      ],
+      "repeat_user_prompt": true,
+      "repeats": 5,
+      "logdir": "agentdojo/runs",
+      "suites": "all",
+      "user_tasks": "all",
+      "injection_tasks": "all",
+      "command": [
+        "<repository>/experiments/agentdojo/.venv/bin/python",
+        "<repository>/experiments/agentdojo/run.py",
+        "--preset",
+        "ifc-rep",
+        "--repeats",
+        "5",
+        "--threads",
+        "32",
+        "--logdir",
+        "agentdojo/runs"
+      ],
+      "env": {},
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 2286.0,
+      "results_path": "agentdojo/runs/gpt-4o-2024-08-06-P-fides-rep-r<1..5>-sasy",
+      "results_relpath": "agentdojo/runs/gpt-4o-2024-08-06-P-fides-rep-r<1..5>-sasy"
+    },
+    {
+      "id": "agentdojo/provenance",
+      "target": "agentdojo",
+      "preset": "provenance",
+      "tag": "C-w2-norep",
+      "row": "Provenance policy (ours)",
+      "arm": "sasy",
+      "defense": null,
+      "switches": [
+        "browse_exception",
+        "confidentiality",
+        "dictated_content",
+        "fetch_gate",
+        "gate_unanchorable",
+        "selection_check",
+        "strict_consent"
+      ],
+      "repeat_user_prompt": false,
+      "repeats": 5,
+      "logdir": "agentdojo/runs",
+      "suites": "all",
+      "user_tasks": "all",
+      "injection_tasks": "all",
+      "command": [
+        "<repository>/experiments/agentdojo/.venv/bin/python",
+        "<repository>/experiments/agentdojo/run.py",
+        "--preset",
+        "provenance",
+        "--repeats",
+        "5",
+        "--threads",
+        "32",
+        "--logdir",
+        "agentdojo/runs"
+      ],
+      "env": {},
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 911.2,
+      "results_path": "agentdojo/runs/gpt-4o-2024-08-06-C-w2-norep-r<1..5>-sasy",
+      "results_relpath": "agentdojo/runs/gpt-4o-2024-08-06-C-w2-norep-r<1..5>-sasy"
+    },
+    {
+      "id": "agentdojo/provenance-rep",
+      "target": "agentdojo",
+      "preset": "provenance-rep",
+      "tag": "C-w2",
+      "row": "Provenance policy (ours)",
+      "arm": "sasy",
+      "defense": null,
+      "switches": [
+        "browse_exception",
+        "confidentiality",
+        "dictated_content",
+        "fetch_gate",
+        "gate_unanchorable",
+        "selection_check",
+        "strict_consent"
+      ],
+      "repeat_user_prompt": true,
+      "repeats": 5,
+      "logdir": "agentdojo/runs",
+      "suites": "all",
+      "user_tasks": "all",
+      "injection_tasks": "all",
+      "command": [
+        "<repository>/experiments/agentdojo/.venv/bin/python",
+        "<repository>/experiments/agentdojo/run.py",
+        "--preset",
+        "provenance-rep",
+        "--repeats",
+        "5",
+        "--threads",
+        "32",
+        "--logdir",
+        "agentdojo/runs"
+      ],
+      "env": {},
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 1469.4,
+      "results_path": "agentdojo/runs/gpt-4o-2024-08-06-C-w2-r<1..5>-sasy",
+      "results_relpath": "agentdojo/runs/gpt-4o-2024-08-06-C-w2-r<1..5>-sasy"
+    }
+  ]
+}

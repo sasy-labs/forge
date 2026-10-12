@@ -1,0 +1,1960 @@
+/*
+    Tau2 Retail Agent Policy
+    ────────────────────────
+
+    Enforces the τ2-bench retail policy from policy.md against the
+    LLM agent (`LLMAgent`). The user-simulator is a separate LLM that
+    speaks through SentMessage; its turns must NEVER be treated as the
+    enforced agent's actions.
+
+    Constraints applied to every rule (verify before adding new ones):
+
+      • Every SentMessage rule that inspects agent-originated content
+        filters on `msg.agent = "LLMAgent"`.
+      • Rules that look at end-user utterances arriving at LLMAgent
+        additionally filter on `msg.agent_role = $UserRole()`.
+      • Rules that look at LLMAgent's own assistant output filter on
+        `msg.agent_role = $Assistant()`.
+      • Tool-call requests / tool results don't need the agent_role
+        filter, but they DO need `msg.agent = "LLMAgent"` so a
+        malicious user-simulator can't impersonate an agent action by
+        emitting tool-call-shaped text.
+      • The policy is fully deterministic — no @llm_check_fn or other
+        oracle functors. Content checks use custom C++ functors in
+        functors.cpp (compiled alongside the policy by the evaluator).
+*/
+/* ── Structured Spec ──────────────────────────────────────────────
+   C1:  Default-allow all actions (fall-through to IsAuthorized).
+   C2:  Authentication gate — every tool except the two lookups,
+        calculate and transfer_to_human_agents requires a prior
+        successful find_user_id_by_email or find_user_id_by_name_zip
+        in the backward slice from the current call. Product reads
+        are not exempt: policy.md L10/L12 authenticate "at the
+        beginning" and allow product information "once the user has
+        been authenticated".
+   C3:  Single-user-per-conversation — when a tool call's user_id
+        argument disagrees with the authenticated user_id, deny
+        (C3); an order write on another user's order is denied (C3b);
+        once two DISTINCT users have been authenticated, a non-exempt
+        call is allowed only for the FIRST authenticated user (its
+        user_id, or an order shown or listed as that user's) or when
+        it names no user and no order (C3c, policy.md L14).
+   C4:  Confirmation gate — every WRITE tool requires the user's
+        LATEST turn to contain affirmative confirmation ("yes", etc.);
+        a modify/exchange call may not switch to new items that an
+        earlier call on the same order, made after that turn, did
+        not name (C4b).
+   C5:  Cancel reason whitelist — cancel_pending_order.reason must be
+        "no longer needed" or "ordered by mistake".
+   C6:  Status check — write tools that operate on an order
+        (cancel/modify/return/exchange) require a prior
+        get_order_details for that order_id.
+   C7:  Once-per-order modify_pending_order_items, AND no further
+        modify/cancel actions on an order whose items have already
+        been modified.
+   C8:  Transfer protocol — the literal handoff text
+        ('YOU ARE BEING TRANSFERRED ...') must be preceded by a
+        successful transfer_to_human_agents tool result.
+   C9:  (Not enforced: text and a tool call in the same turn, see the
+        known limitations.)
+   C10: Payment method for the price difference / refund.
+        modify_pending_order_items and exchange_delivered_order_items:
+        a payment id other than the order's
+        payment_history[0].payment_method_id is denied unless the user
+        named a payment method in the conversation.
+        return_delivered_order_items (policy.md L124): the refund must
+        go to payment_history[0] or to a gift_card_* that exists in the
+        authenticated user's get_user_details profile; nothing else,
+        whatever the user asked for.
+   C11: Gift-card sufficiency on PAYING directions only. The gift
+        card's balance (latest get_user_details snapshot of the
+        authenticated user) must cover what is owed: the price
+        difference of modify_pending_order_items /
+        exchange_delivered_order_items when it is positive, and the
+        order's payment_history[0].amount for
+        modify_pending_order_payment (policy.md L104/L114/L134).
+        Refunds INTO a gift card need no balance.
+   C12: Modify/exchange item checks, fail-closed. item_ids and
+        new_item_ids must be non-empty and of equal length; each
+        item_ids[i] must be an item of THIS order (from its
+        get_order_details); each new_item_ids[i] must be a variant of
+        that item's product whose "available" is true (from
+        get_product_details of that product). Iteration is bounded by
+        Indices(0..32).
+   C13: Modify/exchange pairs must change the variant. Deny when
+        new_item_ids[i] == item_ids[i]; a same-item swap is a no-op.
+   C14: No further writes on an order after a status-changing write.
+   C15: Status values. cancel / modify_* need every observed status
+        of the order (get_order_details or a later write result) to
+        be exactly "pending" — so "pending (item modified)" blocks
+        further modify/cancel; return / exchange need "delivered".
+   C16: (Not enforced: more than one tool call per turn, see the known
+        limitations.)
+   C17: Identifier grounding (policy.md L18). order_id / product_id /
+        item_id arguments must appear in a user turn or an executed,
+        non-error tool result, verbatim or with the leading '#'
+        stripped; an order id's digits alone also count when the user
+        typed them.
+   C18: Address grounding (policy.md L18). The address1 of an address
+        change must come from a user turn or a non-error tool result
+        that precedes the agent's first mention of it.
+   C19: A payment-method change must name a method different from the
+        order's original one (policy.md L102).
+   ───────────────────────────────────────────────────────────────── */
+
+
+/* ── Custom C++ Functors (implemented in functors.cpp) ─────────── */
+
+// Returns 1 iff the message text contains affirmative-confirmation
+// language ("yes", "confirm", "go ahead", "proceed", ...).
+.functor user_confirmed_check(text: symbol): unsigned stateful
+
+// Returns 1 iff the text begins with the "[BLOCKED]" denial marker
+// emitted by the reference monitor for blocked tool calls.
+
+// Returns 1 iff the text contains the literal handoff sentence
+// 'YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON.'
+// (case-insensitive substring on the canonical phrase).
+.functor is_handoff_message(text: symbol): unsigned stateful
+
+// The JSON number at a dotted/bracketed path (same path syntax as
+// @json_get_str_path, e.g. "payment_methods.gift_card_1.balance" or
+// "items[2].price"), in whole CENTS (rounded). -1 on any miss or when
+// the value is not a number. Cents, not dollars, so a shortfall under
+// $1 is still a shortfall.
+.functor json_path_cents(json: symbol, path: symbol): number stateful
+
+// 1 iff the value at the path is the JSON literal `true`; 0 otherwise.
+.functor json_path_is_true(json: symbol, path: symbol): unsigned stateful
+
+// 1 iff `text` contains the exact token `id` as a positive selection
+// (boundary-checked, negation-aware, rejects hypothetical/question context).
+.functor user_selected_payment_id(text: symbol, id: symbol): unsigned stateful
+
+// Returns the order ID (e.g. "#w5838674") named in a compound
+// payment-selection, or "" for simple selections or non-selections.
+.functor user_selected_payment_order(text: symbol, id: symbol): symbol stateful
+
+.functor user_info_only_interjection(text: symbol): unsigned stateful
+.functor user_confirmed_unconditional(text: symbol): unsigned stateful
+.functor proposal_covers_address(proposal: symbol, addr1: symbol,
+    addr2: symbol, city: symbol, state: symbol, zip: symbol,
+    country: symbol): unsigned stateful
+.functor proposal_item_option_in_to_clause(proposal: symbol,
+    val: symbol): unsigned stateful
+.functor proposal_item_option_in_from_clause(proposal: symbol,
+    val: symbol): unsigned stateful
+.functor variant_has_uncovered_option_change(prod: symbol,
+    old_id: symbol, new_id: symbol, proposal: symbol): unsigned stateful
+.functor user_yes_payment_mismatch(text: symbol,
+    proposal: symbol): unsigned stateful
+.functor user_confirmed_charge_cents(text: symbol): number stateful
+.functor proposal_charge_cents(text: symbol): number stateful
+.functor extract_card_ending_from_text(text: symbol): symbol stateful
+.functor proposal_payment_card_ending(text: symbol): symbol stateful
+.functor user_card_selection_ambiguous(text: symbol): number stateful
+.functor proposal_payment_question_cents(text: symbol): number stateful
+.functor str_contains_exact_token(text: symbol,
+    token: symbol): unsigned stateful
+.functor count_order_ids(text: symbol): number stateful
+.functor proposal_address_country(proposal: symbol): symbol stateful
+.functor proposal_has_action_approval_request(text: symbol): unsigned stateful
+.functor proposal_has_affirmative_item_action(proposal: symbol): unsigned stateful
+.functor proposal_item_action_verified(prod: symbol,
+    old_id: symbol, new_id: symbol,
+    proposal: symbol): unsigned stateful
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C1 — Default-allow fall-through
+   ═════════════════════════════════════════════════════════════════ */
+
+IsAuthorized(idx) :- Actions(idx, _).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   Helper relations
+   ═════════════════════════════════════════════════════════════════ */
+
+// The ONLY tool name(s) the LLMAgent can use to authenticate the user.
+.decl IsAuthTool(idx: unsigned)
+IsAuthTool(idx) :- Actions(idx, a), IsTool(a, "find_user_id_by_email").
+IsAuthTool(idx) :- Actions(idx, a), IsTool(a, "find_user_id_by_name_zip").
+
+// Tools that are allowed pre-authentication: auth itself, transfer,
+// and calculate. Product reads (list_all_product_types,
+// get_product_details, get_item_details) are NOT exempt: policy.md
+// L10 authenticates "at the beginning of the conversation" and L12
+// allows product information "once the user has been authenticated".
+.decl IsPreAuthAllowed(idx: unsigned)
+IsPreAuthAllowed(idx) :- IsAuthTool(idx).
+IsPreAuthAllowed(idx) :- Actions(idx, a), IsTool(a, "transfer_to_human_agents").
+IsPreAuthAllowed(idx) :- Actions(idx, a), IsTool(a, "calculate").
+
+// WRITE tools — those that mutate state and require user confirmation.
+.decl IsWriteTool(idx: unsigned)
+IsWriteTool(idx) :- Actions(idx, a), IsTool(a, "cancel_pending_order").
+IsWriteTool(idx) :- Actions(idx, a), IsTool(a, "modify_pending_order_address").
+IsWriteTool(idx) :- Actions(idx, a), IsTool(a, "modify_pending_order_items").
+IsWriteTool(idx) :- Actions(idx, a), IsTool(a, "modify_pending_order_payment").
+IsWriteTool(idx) :- Actions(idx, a), IsTool(a, "modify_user_address").
+IsWriteTool(idx) :- Actions(idx, a), IsTool(a, "return_delivered_order_items").
+IsWriteTool(idx) :- Actions(idx, a), IsTool(a, "exchange_delivered_order_items").
+
+// Subset of write tools that are scoped to a particular order via
+// the `order_id` argument.
+.decl IsOrderWriteTool(idx: unsigned)
+IsOrderWriteTool(idx) :- Actions(idx, a), IsTool(a, "cancel_pending_order").
+IsOrderWriteTool(idx) :- Actions(idx, a), IsTool(a, "modify_pending_order_address").
+IsOrderWriteTool(idx) :- Actions(idx, a), IsTool(a, "modify_pending_order_items").
+IsOrderWriteTool(idx) :- Actions(idx, a), IsTool(a, "modify_pending_order_payment").
+IsOrderWriteTool(idx) :- Actions(idx, a), IsTool(a, "return_delivered_order_items").
+IsOrderWriteTool(idx) :- Actions(idx, a), IsTool(a, "exchange_delivered_order_items").
+
+// Modify/cancel actions that are blocked once items have already
+// been modified for the same order (status becomes "pending (item
+// modified)").
+.decl IsOrderModifyOrCancel(idx: unsigned)
+IsOrderModifyOrCancel(idx) :- Actions(idx, a), IsTool(a, "cancel_pending_order").
+IsOrderModifyOrCancel(idx) :- Actions(idx, a), IsTool(a, "modify_pending_order_address").
+IsOrderModifyOrCancel(idx) :- Actions(idx, a), IsTool(a, "modify_pending_order_items").
+IsOrderModifyOrCancel(idx) :- Actions(idx, a), IsTool(a, "modify_pending_order_payment").
+
+// Tool call's order_id argument (when present).
+.decl ToolOrderId(idx: unsigned, order_id: symbol)
+ToolOrderId(idx, order_id) :-
+    Actions(idx, a),
+    a = $CallTool(_, args),
+    order_id = @json_get_str(args, "order_id"),
+    order_id != "".
+
+// Tool call's user_id argument (when present).
+.decl ToolUserIdArg(idx: unsigned, uid: symbol)
+ToolUserIdArg(idx, uid) :-
+    Actions(idx, a),
+    a = $CallTool(_, args),
+    uid = @json_get_str(args, "user_id"),
+    uid != "".
+
+// Order writes that need a 'pending' order (C15) — the same set C7
+// locks — and those that need a 'delivered' order.
+.decl IsDeliveredOrderWrite(idx: unsigned)
+IsDeliveredOrderWrite(idx) :- Actions(idx, a), IsTool(a, "return_delivered_order_items").
+IsDeliveredOrderWrite(idx) :- Actions(idx, a), IsTool(a, "exchange_delivered_order_items").
+
+// Every payment_method_id argument of the action being checked. Used
+// to anchor profile lookups on the ids we actually need to test.
+.decl CandidatePm(pm: symbol)
+CandidatePm(pm) :-
+    Actions(_, a),
+    a = $CallTool(_, args),
+    pm = @json_get_str(args, "payment_method_id"),
+    pm != "".
+
+// An executed tool result in the backward slice, with the body the
+// tool returned. ToolResult tuples exist only for authorized +
+// executed calls (see OrderOriginalPayment), and the call must have
+// come from an LLMAgent message. A tool that raised returns a plain
+// "Error: ..." string; rules that need data parse the body, so an
+// error body simply yields no field.
+.decl Obs(rid: symbol, fn: symbol, contents: symbol)
+Obs(rid, fn, contents) :-
+    CurrentDepends(rid),
+    ToolResult(rid, fn, _),
+    Edge(src, rid),
+    SentMessage(src, src_msg),
+    src_msg.agent = "LLMAgent",
+    SentMessage(rid, rmsg),
+    contents = rmsg.contents.
+
+// Position of a message in the current assistant turn's input
+// history (EdgeData message_index into the Current node). Used only
+// to pick the latest of several profile snapshots (C11).
+.decl HistIdx(id: symbol, k: number)
+HistIdx(id, k) :-
+    Current(c),
+    EdgeData(id, c, ed),
+    k = ed.message_index,
+    k >= 0.
+
+
+/* ═════════════════════════════════════════════════════════════════
+   Authentication state
+   ═════════════════════════════════════════════════════════════════ */
+
+// The LLMAgent successfully authenticated the user during this
+// conversation if a prior find_user_id_* tool produced a non-empty,
+// non-error result. ToolResult tuples are emitted only for AUTHORIZED
+// executions (the agent_summary documents that denial events omit
+// `derived_from`), so reaching ToolResult implies the call ran.
+//
+// We also require the originating assistant message — the tool-call
+// REQUEST itself — to have been emitted by `agent="LLMAgent"`. This
+// closes the impersonation hole the customer flagged: a
+// user-simulator turn that happens to mention a tool name cannot
+// satisfy this predicate because no real ToolResult is recorded for
+// it, and the proximal source of any real ToolResult is an
+// LLMAgent assistant message.
+.decl Authenticated()
+Authenticated() :- AuthenticatedUserId(_).
+
+// A successful user lookup: its result node and the user_id it
+// returned (the string returned by the auth tool).
+.decl AuthLookup(rid: symbol, uid: symbol)
+AuthLookup(rid, uid) :-
+    CurrentDepends(rid),
+    ToolResult(rid, "find_user_id_by_email", _),
+    Edge(src, rid),
+    SentMessage(src, src_msg),
+    src_msg.agent = "LLMAgent",
+    SentMessage(rid, rmsg),
+    uid = rmsg.contents,
+    uid != "",
+    @str_contains(uid, "Error") = 0.
+
+AuthLookup(rid, uid) :-
+    CurrentDepends(rid),
+    ToolResult(rid, "find_user_id_by_name_zip", _),
+    Edge(src, rid),
+    SentMessage(src, src_msg),
+    src_msg.agent = "LLMAgent",
+    SentMessage(rid, rmsg),
+    uid = rmsg.contents,
+    uid != "",
+    @str_contains(uid, "Error") = 0.
+
+// The authenticated user_id(s). Used for the single-user-per-
+// conversation checks.
+.decl AuthenticatedUserId(uid: symbol)
+AuthenticatedUserId(uid) :- AuthLookup(_, uid).
+
+// The FIRST authenticated user: the one returned by the earliest
+// successful lookup in the history (lowest message_index). This is
+// the conversation's user for C3c. With no message_index on any
+// lookup there is no first user, and C3c then denies every
+// user- or order-scoped call once a second user exists.
+.decl AuthLookupIdx(k: number)
+AuthLookupIdx(k) :- AuthLookup(rid, _), HistIdx(rid, k).
+
+.decl PrimaryUserId(uid: symbol)
+PrimaryUserId(uid) :-
+    AuthLookup(rid, uid),
+    HistIdx(rid, k),
+    k = min k2 : { AuthLookupIdx(k2) }.
+
+
+/* ═════════════════════════════════════════════════════════════════
+   User affirmative confirmation (for WRITE tools)
+   ═════════════════════════════════════════════════════════════════ */
+
+// A user turn the LLMAgent saw (Role.USER from the user simulator,
+// not a UserSimulator-internal Role.LLM event or another agent's
+// utterance), with its position in the current input history.
+.decl UserTurnAt(mid: symbol, k: number)
+UserTurnAt(mid, k) :-
+    CurrentDepends(mid),
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $UserRole(),
+    HistIdx(mid, k).
+
+.decl LatestUserTurnIdx(k: number)
+LatestUserTurnIdx(k) :-
+    UserTurnAt(_, _),
+    k = max k2 : { UserTurnAt(_, k2) }.
+
+// The user's latest turn contains affirmative confirmation language.
+// Several writes in a row after one "yes" share that latest turn, so
+// one yes to a listed plan covers all of its writes; a later user turn
+// that is not a yes (a question, a change of plan, an objection) ends
+// it. With no message_index in the history there is no latest turn
+// and every write is denied.
+.decl UserConfirmed()
+UserConfirmed() :-
+    LatestUserTurnIdx(k),
+    UserTurnAt(mid, k),
+    SentMessage(mid, msg),
+    @user_confirmed_check(msg.contents) = 1.
+
+/* ── Action-scoped preserved confirmation ─────────────────────────
+
+   When the user's latest turn is NOT itself a "yes" but an unrelated
+   information-only interjection (a tracking question, a status
+   inquiry), a prior confirmation can preserve writes on the exact
+   scope the agent proposed. This is NOT a global fallback: it is
+   action-indexed, per tool call, and verifies:
+
+     1. A prior user YES turn exists (not the latest).
+     2. The YES came AFTER the agent's most recent assistant PROPOSAL
+        of this specific action for this order. A "proposal" is an
+        assistant message that contains the order_id AND an
+        unconditional structured description of the action (address
+        section with full address, or item-change section with the
+        variant description and price difference). An unrelated
+        mention of the order or a conditional/question-only proposal
+        does not qualify.
+     3. Every user turn between the YES and the latest is a narrowly
+        whitelisted information-only interjection.
+     4. The tool call's arguments match the confirmed proposal:
+        - modify_pending_order_address: every address field
+          (address1, address2, city, state, zip, country) matches
+          the authenticated user's profile address.
+        - modify_pending_order_items: C12-verified, the original
+          item, the selected new variant's options appear in the
+          proposal's item-change section (scoped to the "from X to
+          Y" clause, not the whole text), and the payment method
+          matches the user's confirmed card.
+
+   Bounded to these two tools; other writes require latest-turn YES.
+   ──────────────────────────────────────────────────────────────── */
+
+/* For preserved confirmation, the YES must be unconditional. */
+.decl UserTurnHasAffirmative(mid: symbol, k: number)
+UserTurnHasAffirmative(mid, k) :-
+    UserTurnAt(mid, k),
+    SentMessage(mid, msg),
+    @user_confirmed_unconditional(msg.contents) = 1.
+
+/* An assistant turn that contains an unconditional structured
+   proposal for an action on this order (not a mere mention).
+   The order ID must appear as an exact token (not a prefix of a
+   longer ID), and the proposal must mention exactly one order to
+   avoid ambiguous multi-order proposals. */
+.decl AgentProposedActionAt(oid: symbol, k: number, text: symbol)
+AgentProposedActionAt(oid, k, text) :-
+    ToolOrderId(_, oid),
+    CurrentDepends(mid),
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $Assistant(),
+    HistIdx(mid, k),
+    @str_contains_exact_token(msg.contents, oid) = 1,
+    @count_order_ids(msg.contents) = 1,
+    @proposal_has_action_approval_request(msg.contents) = 1,
+    text = msg.contents.
+
+.decl InterveningNonInfoTurn(k_yes: number)
+InterveningNonInfoTurn(k_yes) :-
+    UserTurnHasAffirmative(_, k_yes),
+    UserTurnAt(mid, k),
+    k > k_yes,
+    SentMessage(mid, msg),
+    @user_info_only_interjection(msg.contents) = 0.
+
+/* An intervening non-empty assistant turn between the proposal and
+   the user's YES invalidates the binding: the YES may answer the
+   intervening message, not the original proposal. Any substantive
+   assistant content (not just literal "?") counts — "Please reply
+   YES if you received the tracking" without a question mark still
+   interposes. */
+.decl InterveningAgentQuestion(k_prop: number, k_yes: number)
+InterveningAgentQuestion(k_prop, k_yes) :-
+    AgentProposedActionAt(_, k_prop, _),
+    UserTurnHasAffirmative(_, k_yes),
+    k_yes > k_prop,
+    CurrentDepends(amid),
+    SentMessage(amid, amsg),
+    amsg.agent = "LLMAgent",
+    amsg.agent_role = $Assistant(),
+    HistIdx(amid, k_a),
+    k_a > k_prop,
+    k_a < k_yes,
+    amsg.contents != "".
+
+.decl AgentProposalBeforeYes(oid: symbol, k_prop: number, k_yes: number)
+AgentProposalBeforeYes(oid, k_prop, k_yes) :-
+    AgentProposedActionAt(oid, k_prop, _),
+    UserTurnHasAffirmative(_, k_yes),
+    k_prop < k_yes,
+    !InterveningAgentQuestion(k_prop, k_yes).
+
+.decl ProposalText(oid: symbol, text: symbol, k_yes: number)
+ProposalText(oid, text, k_yes) :-
+    AgentProposalBeforeYes(oid, k_prop, k_yes),
+    k_prop = max kp : { AgentProposalBeforeYes(oid, kp, _) },
+    AgentProposedActionAt(oid, k_prop, text).
+
+/* modify_pending_order_address: proposal must cover address action
+   and every address field must match the profile. The approving
+   k_yes is carried from AgentProposalBeforeYes so the intervening-
+   turn check uses the SAME YES that established the proposal. */
+.decl PreservedConfirmation(idx: unsigned)
+PreservedConfirmation(idx) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_address"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"), oid != "",
+    ProposalText(oid, proposal, k_yes),
+    LatestUserTurnIdx(k_latest),
+    k_yes < k_latest,
+    !InterveningNonInfoTurn(k_yes),
+    AuthProfile(_, profile),
+    a1  = @json_get_str(args, "address1"),
+    a2  = @json_get_str(args, "address2"),
+    ci  = @json_get_str(args, "city"),
+    st  = @json_get_str(args, "state"),
+    zp  = @json_get_str(args, "zip"),
+    co  = @json_get_str(args, "country"),
+    @str_to_lower(a1) = @str_to_lower(@json_get_str_path(profile, "address.address1")),
+    @str_to_lower(a2) = @str_to_lower(@json_get_str_path(profile, "address.address2")),
+    @str_to_lower(ci) = @str_to_lower(@json_get_str_path(profile, "address.city")),
+    @str_to_lower(st) = @str_to_lower(@json_get_str_path(profile, "address.state")),
+    zp = @json_get_str_path(profile, "address.zip"),
+    @str_to_lower(co) = @str_to_lower(@json_get_str_path(profile, "address.country")),
+    @proposal_covers_address(proposal, a1, a2, ci, st, zp, co) = 1,
+    ProposalAddressOk(oid, co).
+
+/* modify_pending_order_items: proposal must cover the item change
+   with the selected variant's distinguishing options appearing in
+   the "to" clause. Carried k_yes binds all evidence to the same
+   approving turn. Requires POSITIVE proof of charge and card
+   identity agreement — missing proof requires fresh confirmation. */
+PreservedConfirmation(idx) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_items"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"), oid != "",
+    ProposalText(oid, proposal, k_yes),
+    LatestUserTurnIdx(k_latest),
+    k_yes < k_latest,
+    !InterveningNonInfoTurn(k_yes),
+    ItemChangeLens(idx, n, n), n = 1,
+    cnt = count : { ItemPairOk(idx, _) },
+    cnt = as(n, number),
+    Obs(_, "get_product_details", prod),
+    @json_get_str(prod, "product_id") != "",
+    ItemPairAt(idx, 0, _, old_id, new_id),
+    old_id != "", new_id != "",
+    @proposal_item_action_verified(prod, old_id, new_id, proposal) = 1,
+    !UserSelectedDifferentPayment(idx, oid, k_yes),
+    pm = @json_get_str(args, "payment_method_id"),
+    OrderOriginalPayment(oid, pm),
+    ChargeVerified(idx, oid, k_yes),
+    CardVerified(idx, oid, k_yes).
+
+/* True when ANY option of the variant swap is not properly covered
+   by the proposal. Checks ALL option keys in the catalog (not a fixed
+   set), verifies kept-clause values match actual variant options, and
+   rejects multi-item modifications. */
+.decl DistinguishingOptionMissing(idx: unsigned, oid: symbol)
+
+/* Multi-position calls fail closed. */
+DistinguishingOptionMissing(idx, oid) :-
+    ItemPairAt(idx, _, oid, _, _),
+    ItemChangeLens(idx, n, n),
+    n > 1.
+
+/* Comprehensive option check via functor: iterates ALL option keys
+   from both variants, checks from/to clauses, and verifies keeping
+   clause values match the actual new variant. */
+DistinguishingOptionMissing(idx, oid) :-
+    ItemPairAt(idx, 0, oid, old_id, new_id),
+    old_id != "", new_id != "",
+    Obs(_, "get_product_details", prod),
+    @json_get_str(prod, "product_id") != "",
+    ProposalText(oid, proposal, _),
+    @variant_has_uncovered_option_change(prod, old_id, new_id, proposal) = 1.
+
+/* User's approving turn explicitly selected a different card ending
+   than the proposal mentioned. Bound to k_yes so only the approving
+   turn is checked, not earlier/unrelated affirmative turns. */
+.decl UserSelectedDifferentPayment(idx: unsigned, oid: symbol,
+    k_yes: number)
+UserSelectedDifferentPayment(idx, oid, k_yes) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_items"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"), oid != "",
+    ProposalText(oid, proposal, k_yes),
+    UserTurnHasAffirmative(umid, k_yes),
+    SentMessage(umid, umsg),
+    @user_yes_payment_mismatch(umsg.contents, proposal) = 1.
+
+/* ── Positive proof: charge verified ──────────────────────────────
+   For a price increase, the approved proposal must state an
+   unambiguous charge that equals the trusted catalog difference.
+   The approving turn's explicit amount, if any, must also agree.
+   Missing or failed parse → no proof → requires fresh confirmation.
+   Fires only when there IS a positive increase to verify; zero-cost
+   swaps are trivially verified. */
+.decl ChargeVerified(idx: unsigned, oid: symbol, k_yes: number)
+// No price increase → trivially verified.
+ChargeVerified(idx, oid, k_yes) :-
+    ItemPairAt(idx, 0, oid, _, _),
+    ItemPairVerified(idx, 0, delta),
+    delta <= 0,
+    ProposalText(oid, _, k_yes).
+// Price increase: proposal states the correct difference.
+// Uses ItemPairVerified's order-paid-price delta (new catalog
+// price minus the price actually recorded on the order), which
+// matches what the tool charges.
+ChargeVerified(idx, oid, k_yes) :-
+    ItemPairAt(idx, 0, oid, _, _),
+    ItemPairVerified(idx, 0, delta),
+    delta > 0,
+    ProposalText(oid, proposal, k_yes),
+    prop_cents = @proposal_charge_cents(proposal),
+    prop_cents = delta,
+    pq_cents = @proposal_payment_question_cents(proposal),
+    pq_cents = delta,
+    !UserChargeContradicts(idx, oid, k_yes).
+// User's explicit amount (if stated in the approving turn)
+// contradicts the actual diff. Bound to k_yes.
+.decl UserChargeContradicts(idx: unsigned, oid: symbol,
+    k_yes: number)
+UserChargeContradicts(idx, oid, k_yes) :-
+    ItemPairAt(idx, 0, oid, _, _),
+    ItemPairVerified(idx, 0, delta),
+    UserTurnHasAffirmative(umid, k_yes),
+    SentMessage(umid, umsg),
+    confirmed_cents = @user_confirmed_charge_cents(umsg.contents),
+    confirmed_cents >= 0,
+    confirmed_cents != delta.
+
+/* ── Positive proof: card identity verified ───────────────────────
+   The action's payment_method_id must resolve (via AuthProfile
+   last_four metadata) to a card ending that matches the approved
+   selection. The approved ending is the user's explicit selection
+   if stated; otherwise the proposal's stated ending (bare YES
+   inherits). Missing last_four metadata or no parseable ending in
+   either source → no positive proof → requires fresh confirmation. */
+.decl CardVerified(idx: unsigned, oid: symbol, k_yes: number)
+CardVerified(idx, oid, k_yes) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_items"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"), oid != "",
+    pm = @json_get_str(args, "payment_method_id"), pm != "",
+    AuthProfile(_, profile),
+    pm_last4 = @json_get_str_path(profile,
+        cat("payment_methods.", pm, ".last_four")),
+    pm_last4 != "",
+    ProposalText(oid, proposal, k_yes),
+    ApprovedCardEnding(oid, k_yes, approved_ending),
+    approved_ending = pm_last4.
+// The approved card ending: user's explicit selection takes priority;
+// otherwise inherit from the proposal. Both bound to k_yes.
+.decl ApprovedCardEnding(oid: symbol, k_yes: number, ending: symbol)
+// User explicitly named a card ending in their approving turn.
+// Blocked when the payment selection is ambiguous (conflicting
+// cards, conflicting amounts, or malformed digit sequences).
+ApprovedCardEnding(oid, k_yes, user_ending) :-
+    ProposalText(oid, _, k_yes),
+    UserTurnHasAffirmative(umid, k_yes),
+    SentMessage(umid, umsg),
+    user_ending = @extract_card_ending_from_text(umsg.contents),
+    user_ending != "",
+    @user_card_selection_ambiguous(umsg.contents) = 0.
+// Bare YES: inherit from proposal's PAYMENT-SELECTION section.
+// Blocked when the user attempted a card selection but it was
+// ambiguous (conflicting or malformed digit sequences).
+ApprovedCardEnding(oid, k_yes, prop_ending) :-
+    ProposalText(oid, proposal, k_yes),
+    UserTurnHasAffirmative(umid, k_yes),
+    SentMessage(umid, umsg),
+    @extract_card_ending_from_text(umsg.contents) = "",
+    @user_card_selection_ambiguous(umsg.contents) = 0,
+    prop_ending = @proposal_payment_card_ending(proposal),
+    prop_ending != "".
+
+/* ── Positive proof: proposal destination country ─────────────────
+   The approved proposal's destination address country must either
+   (a) match the action's country explicitly, or (b) be omitted
+   when all six action address fields already equal the trusted
+   AuthProfile address (the default-profile destination). An
+   explicit conflicting country (e.g. "Canada" vs "USA") denies.
+   An unrecognized or untrusted destination without positive match
+   also denies. */
+.decl ProposalAddressOk(oid: symbol, co: symbol)
+// Explicit country in proposal matches action country.
+ProposalAddressOk(oid, co) :-
+    Actions(_, a),
+    IsTool(a, "modify_pending_order_address"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"), oid != "",
+    co = @json_get_str(args, "country"),
+    ProposalText(oid, proposal, _),
+    prop_country = @proposal_address_country(proposal),
+    prop_country != "",
+    @str_to_lower(prop_country) = @str_to_lower(co).
+// No country in proposal, but all action fields equal profile (trusted default).
+ProposalAddressOk(oid, co) :-
+    Actions(_, a),
+    IsTool(a, "modify_pending_order_address"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"), oid != "",
+    co = @json_get_str(args, "country"),
+    ProposalText(oid, proposal, _),
+    @proposal_address_country(proposal) = "",
+    AuthProfile(_, profile),
+    @str_to_lower(co) = @str_to_lower(
+        @json_get_str_path(profile, "address.country")).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   Order status check + items-already-modified bookkeeping
+   ═════════════════════════════════════════════════════════════════ */
+
+// The agent has previously called get_order_details for this order
+// in the current backward slice. Required by the policy before any
+// write action ("you should check its status before taking the
+// action").
+.decl OrderChecked(order_id: symbol)
+OrderChecked(order_id) :-
+    CurrentDepends(rid),
+    ToolResult(rid, "get_order_details", _),
+    Edge(src, rid),
+    SentMessage(src, src_msg),
+    src_msg.agent = "LLMAgent",
+    SentMessage(rid, rmsg),
+    order_id = @json_get_str(rmsg.contents, "order_id"),
+    order_id != "".
+
+// A successful prior modify_pending_order_items for this order_id
+// in the current backward slice. After this, the policy says the
+// order is locked from further modify/cancel.
+//
+// We bind order_id from the *response* contents (not the call args):
+// a successful modify returns the updated order JSON whose top-level
+// "order_id" field is non-empty, while a runtime failure returns a
+// plain "Error: ..." string for which @json_get_str(_, "order_id")
+// returns "". This guards the lock against errored writes (a failed
+// call did not actually mutate the order, so it must not block
+// future writes).
+.decl OrderItemsAlreadyModified(order_id: symbol)
+OrderItemsAlreadyModified(order_id) :-
+    CurrentDepends(rid),
+    ToolResult(rid, "modify_pending_order_items", _),
+    Edge(src, rid),
+    SentMessage(src, src_msg),
+    src_msg.agent = "LLMAgent",
+    SentMessage(rid, rmsg),
+    order_id = @json_get_str(rmsg.contents, "order_id"),
+    order_id != "".
+
+// The order's original payment method, extracted from the first
+// entry of payment_history in a prior get_order_details result.
+// Tau2's retail policy says refunds and modification price-deltas
+// must go to this payment method (or to a gift card).
+//
+// IMPORTANT: ToolResult(rid, fn, args) carries the CALL args (only
+// {"order_id": ...} for get_order_details), not the response body.
+// The response is in SentMessage(rid, rmsg).contents, which holds
+// the JSON-serialized order including payment_history. Earlier
+// versions of this rule looked up payment_history[0] in `args` and
+// silently produced no tuples — C10/C11/C12 were dead code as a
+// result.
+//
+// Blocked tool calls do NOT produce ToolResult tuples — the SASY
+// instrumentation's denial path emits a message Event without a
+// `derived_from`, and the shim only inserts ToolResult when the
+// node carries a derived_from. So binding to ToolResult here is
+// already filtered to authorized + executed calls.
+.decl OrderOriginalPayment(order_id: symbol, pm: symbol)
+OrderOriginalPayment(order_id, pm) :-
+    CurrentDepends(rid),
+    ToolResult(rid, "get_order_details", _),
+    Edge(src, rid),
+    SentMessage(src, src_msg),
+    src_msg.agent = "LLMAgent",
+    SentMessage(rid, rmsg),
+    order_id = @json_get_str(rmsg.contents, "order_id"),
+    order_id != "",
+    pm = @json_get_str_path(rmsg.contents, "payment_history[0].payment_method_id"),
+    pm != "".
+
+
+/* ═════════════════════════════════════════════════════════════════
+   Transfer protocol
+   ═════════════════════════════════════════════════════════════════ */
+
+// The agent has successfully called transfer_to_human_agents earlier
+// in the slice.
+.decl TransferCalled()
+TransferCalled() :-
+    CurrentDepends(rid),
+    ToolResult(rid, "transfer_to_human_agents", _),
+    Edge(src, rid),
+    SentMessage(src, src_msg),
+    src_msg.agent = "LLMAgent".
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C2 — Authentication required before non-auth tools
+   ═════════════════════════════════════════════════════════════════ */
+
+// @deny_message: User has not been authenticated; call find_user_id_by_email or find_user_id_by_name_zip first
+// @suggestion: Authenticate the user (via email or name+zip) before any other tool calls
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsToolCall(a),
+    !IsPreAuthAllowed(idx),
+    !Authenticated().
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C3 — Single-user-per-conversation: tool's user_id must match auth
+   ═════════════════════════════════════════════════════════════════ */
+
+// @deny_message: Tool's user_id argument does not match the authenticated user
+// @suggestion: Only operate on the authenticated user's profile and orders; ask the user to re-authenticate if a different user is intended
+//
+// Negation form: deny if some auth happened AND the call's uid is NOT
+// among the set of authenticated uids. Earlier formulation was
+// `AuthenticatedUserId(auth_uid), uid != auth_uid`, which fires for
+// *any* tuple that disagrees — broken when the agent retried auth
+// (first attempt errored, second succeeded → two AuthenticatedUserId
+// tuples; rule wrongly fired against the failed-attempt tuple even
+// when the call matched the successful one).
+Unauthorized(idx) :-
+    ToolUserIdArg(idx, uid),
+    AuthenticatedUserId(_),
+    !AuthenticatedUserId(uid).
+
+
+// Owner of an order, per the order payload the agent retrieved.
+.decl OrderOwner(order_id: symbol, owner_id: symbol)
+OrderOwner(order_id, owner_id) :-
+    CurrentDepends(rid),
+    ToolResult(rid, "get_order_details", _),
+    Edge(src, rid),
+    SentMessage(src, src_msg),
+    src_msg.agent = "LLMAgent",
+    SentMessage(rid, rmsg),
+    order_id = @json_get_str(rmsg.contents, "order_id"), order_id != "",
+    owner_id = @json_get_str(rmsg.contents, "user_id"), owner_id != "".
+
+/* C3b: an order-scoped write must target an order belonging to the
+   authenticated user. C3 above only compares a `user_id` ARGUMENT, and
+   just two tools carry one — so authenticating as one customer and
+   then cancelling another customer's order passed every check. Same
+   negation shape as C3 so a retried authentication (one failed tuple,
+   one good one) cannot trip it. */
+// @deny_message: this order belongs to a different user than the authenticated one
+// @suggestion: Only act on orders belonging to the authenticated user. If the user is asking about someone else's order, authenticate as that user first.
+Unauthorized(idx) :-
+    IsOrderWriteTool(idx),
+    Actions(idx, a),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"), oid != "",
+    OrderOwner(oid, owner_id),
+    AuthenticatedUserId(_),
+    !AuthenticatedUserId(owner_id).
+
+/* C3c: one user per conversation (policy.md L14: "You can only help
+   one user per conversation (but you can handle multiple requests
+   from the same user), and must deny any requests for tasks related
+   to any other user"). C3 and C3b accept ANY authenticated uid, so
+   authenticating a second customer would make that customer's
+   profile and orders reachable. Once two distinct user ids have been
+   authenticated, a non-exempt call is allowed only when it is for
+   the FIRST authenticated user (PrimaryUserId):
+     • its user_id argument is that user; or
+     • its order_id is that user's order: the order's own
+       get_order_details shows that user_id, or the order is listed
+       in that user's get_user_details "orders"; or
+     • it names no user and no order (list_all_product_types,
+       get_product_details, get_item_details): product information
+       carries no customer data.
+   Anything else (the second user's profile, their orders, an order
+   whose owner is not yet known) is denied. A failed lookup
+   ("Error: ...") yields no AuthenticatedUserId, and a repeated lookup
+   of the same user yields the same id, so neither trips this. */
+.decl MultiUser()
+MultiUser() :-
+    AuthenticatedUserId(u1),
+    AuthenticatedUserId(u2),
+    u1 != u2.
+
+// An order listed in the first user's own get_user_details profile.
+.decl PrimaryProfileOrder(order_id: symbol)
+PrimaryProfileOrder(oid) :-
+    PrimaryUserId(uid),
+    Obs(_, "get_user_details", c),
+    @json_get_str(c, "user_id") = uid,
+    n = @json_array_len(c, "orders"),
+    Indices(i),
+    i < n,
+    oid = @json_array_get_str(c, "orders", i),
+    oid != "".
+
+.decl ForPrimaryUser(idx: unsigned)
+ForPrimaryUser(idx) :- ToolUserIdArg(idx, uid), PrimaryUserId(uid).
+ForPrimaryUser(idx) :- ToolOrderId(idx, oid), OrderOwner(oid, uid), PrimaryUserId(uid).
+ForPrimaryUser(idx) :- ToolOrderId(idx, oid), PrimaryProfileOrder(oid).
+ForPrimaryUser(idx) :-
+    Actions(idx, a),
+    IsToolCall(a),
+    !ToolUserIdArg(idx, _),
+    !ToolOrderId(idx, _).
+
+// @deny_message: a second, different user has been authenticated in this conversation; this call is not for the first authenticated user, and only one user can be helped per conversation
+// @suggestion: Continue only with the first authenticated user: use that user's user_id, and only orders listed in that user's get_user_details profile (look the profile up first if needed). Deny requests about any other user, or transfer to a human agent if the user needs help for someone else.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsToolCall(a),
+    !IsPreAuthAllowed(idx),
+    MultiUser(),
+    !ForPrimaryUser(idx).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C4 — Confirmation gate for WRITE tools
+   ═════════════════════════════════════════════════════════════════ */
+
+// @deny_message: Write action requires explicit user confirmation ("yes") in the user's latest message
+// @suggestion: List the action details to the user, ask them to confirm with "yes", and retry after their reply
+Unauthorized(idx) :-
+    IsWriteTool(idx),
+    !UserConfirmed(),
+    !PreservedConfirmation(idx).
+
+/* C4b — A "yes" covers the items it was given for. After the user's
+   latest turn, if an earlier assistant turn already made a
+   modify/exchange call on this order (typically one that was denied),
+   this call may not name a new item that the earlier call did not:
+   the user agreed to the earlier items, not to the substitute.
+   Retrying the same items is allowed. */
+.decl PrevItemCall(mid: symbol, i: unsigned, fn: symbol, order_id: symbol)
+.decl PrevItemCallNew(mid: symbol, i: unsigned, new_id: symbol)
+// Live shape: each call's arguments are a JSON string.
+PrevItemCall(mid, i, fn, oid) :-
+    LatestUserTurnIdx(ku),
+    HistIdx(mid, k),
+    k > ku,
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $Assistant(),
+    msg.tools_json != "",
+    n = @json_array_len(msg.tools_json, ""),
+    Indices(i),
+    i < n,
+    fn = @json_array_get_field_str(msg.tools_json, "", i, "name"),
+    (fn = "modify_pending_order_items"; fn = "exchange_delivered_order_items"),
+    args = @json_array_get_field_str(msg.tools_json, "", i, "arguments"),
+    args != "",
+    oid = @json_get_str(args, "order_id"),
+    oid != "".
+PrevItemCallNew(mid, i, new_id) :-
+    PrevItemCall(mid, i, _, _),
+    SentMessage(mid, msg),
+    args = @json_array_get_field_str(msg.tools_json, "", i, "arguments"),
+    args != "",
+    m = @json_array_len(args, "new_item_ids"),
+    Indices(q),
+    q < m,
+    new_id = @json_array_get_str(args, "new_item_ids", q).
+// Captured shape: arguments are an object; read them by path.
+PrevItemCall(mid, i, fn, oid) :-
+    LatestUserTurnIdx(ku),
+    HistIdx(mid, k),
+    k > ku,
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $Assistant(),
+    msg.tools_json != "",
+    n = @json_array_len(msg.tools_json, ""),
+    Indices(i),
+    i < n,
+    fn = @json_array_get_field_str(msg.tools_json, "", i, "name"),
+    (fn = "modify_pending_order_items"; fn = "exchange_delivered_order_items"),
+    p = cat("[", to_string(as(i, number)), "].arguments"),
+    oid = @json_get_str_path(msg.tools_json, cat(p, ".order_id")),
+    oid != "".
+PrevItemCallNew(mid, i, new_id) :-
+    PrevItemCall(mid, i, _, _),
+    SentMessage(mid, msg),
+    p = cat("[", to_string(as(i, number)), "].arguments.new_item_ids"),
+    m = @json_array_len(msg.tools_json, p),
+    Indices(q),
+    q < m,
+    new_id = @json_array_get_str(msg.tools_json, p, q).
+
+// @deny_message: this call names a new item that the user did not confirm: an earlier call on this order since the user's latest message named different items
+// @suggestion: Tell the user which new item(s) you now intend to use, list the full change again, and wait for an explicit "yes" before calling this tool.
+Unauthorized(idx) :-
+    ItemPairAt(idx, _, oid, _, new_id),
+    Actions(idx, a),
+    a = $CallTool(fn, _),
+    PrevItemCall(mid, i, fn, oid),
+    !PrevItemCallNew(mid, i, new_id).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C5 — Cancel reason: whitelist + user must state it
+
+   τ2 retail policy.md (Cancel pending order):
+     "The user needs to confirm the order id and the reason
+      (either 'no longer needed' or 'ordered by mistake') for
+      cancellation. Other reasons are not acceptable."
+
+   Two rules:
+     C5a — value whitelist: reason ∈ {"no longer needed",
+           "ordered by mistake"}.
+     C5b — origination: the user must have uttered the chosen reason
+           verbatim in their own message. The agent cannot pick the
+           reason on the user's behalf — "user needs to confirm the
+           reason" rules out the agent silently filling it in or
+           treating a bare "yes" to a yes/no prompt as confirmation
+           of a reason value the user never named.
+
+   Both reasons are policy-acceptable; there is no "deny because
+   reason X is wrong" test in retail (no analog to airline's
+   trivial-social-reason rule). C5b is about who originates the
+   value — policy mandates the user — not about which value is
+   right.
+
+   "UserMessage" is strictly an LLMAgent message with $UserRole()
+   role; msg.agent = "LLMAgent" guards against impersonation.
+   ═════════════════════════════════════════════════════════════════ */
+
+// True when the given cancellation-reason string appears verbatim in
+// a user (UserRole) message within the current backward slice.
+/* The reason is settled when the user said it themselves, or when the
+   agent put THAT SPECIFIC reason to them and they agreed. A bare
+   `UserConfirmed()` is not enough on its own: it is conversation-wide,
+   so an "ok" given to any earlier question would stand in for a reason
+   the user was never asked about. Requiring the agent to have named
+   the reason keeps the user's agreement attached to something. */
+.decl UserConfirmMessage(mid: symbol)
+UserConfirmMessage(mid) :-
+    CurrentDepends(mid),
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $UserRole(),
+    @user_confirmed_check(msg.contents) = 1.
+
+/* The user's "yes" has to answer THE PROPOSAL, not float loose in the
+   conversation. Same proximal chain the airline policy uses: the
+   confirming user turn's immediate predecessor is the agent turn that
+   named the reason. Pairing an unordered `UserConfirmed()` with an
+   unordered "agent said it somewhere" would let an "ok" given ten
+   turns earlier, to an unrelated question, stand in as agreement. */
+.decl AgentProposedCancelReason(reason: symbol)
+AgentProposedCancelReason(reason) :-
+    UserConfirmMessage(user_mid),
+    Edge(u_flip_mid, user_mid),
+    EdgeData(a_flip_mid, u_flip_mid, edge_data),
+    edge_data.proximal = 1,
+    Edge(orig_mid, a_flip_mid),
+    SentMessage(orig_mid, orig_msg),
+    orig_msg.agent = "LLMAgent",
+    orig_msg.agent_role = $Assistant(),
+    (reason = "no longer needed"; reason = "ordered by mistake"),
+    @str_contains(@str_to_lower(orig_msg.contents), reason) = 1.
+
+.decl CancelReasonSettled(reason: symbol)
+CancelReasonSettled(reason) :- UserUtteredCancelReason(reason).
+CancelReasonSettled(reason) :- AgentProposedCancelReason(reason).
+
+.decl UserUtteredCancelReason(reason: symbol)
+UserUtteredCancelReason(reason) :-
+    CurrentDepends(mid),
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $UserRole(),
+    (reason = "no longer needed"; reason = "ordered by mistake"),
+    @str_contains(@str_to_lower(msg.contents), reason) = 1.
+
+// @deny_message: cancel_pending_order reason must be "no longer needed" or "ordered by mistake"
+// @suggestion: Confirm with the user that the cancellation reason is one of the two acceptable values, then retry
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "cancel_pending_order"),
+    a = $CallTool(_, args),
+    reason = @json_get_str(args, "reason"),
+    reason != "no longer needed",
+    reason != "ordered by mistake".
+
+// @deny_message: the cancellation reason was neither stated nor confirmed by the user
+// @suggestion: Ask the user which of the two acceptable reasons applies — "no longer needed" or "ordered by mistake" — and wait for their answer before cancelling. Either their own wording of the reason or an explicit confirmation of the one you proposed is sufficient.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "cancel_pending_order"),
+    a = $CallTool(_, args),
+    reason = @json_get_str(args, "reason"),
+    (reason = "no longer needed"; reason = "ordered by mistake"),
+    !CancelReasonSettled(reason).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C6 — Order status must have been checked before write actions
+   ═════════════════════════════════════════════════════════════════ */
+
+// @deny_message: Order status must be checked via get_order_details before this write action
+// @suggestion: Call get_order_details for the order_id, verify its status is pending/delivered, then retry
+Unauthorized(idx) :-
+    IsOrderWriteTool(idx),
+    ToolOrderId(idx, oid),
+    !OrderChecked(oid).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C15 — The order's status VALUE must allow the write
+
+   policy.md L82 "you can only take action on pending or delivered
+   orders"; L88 / L96 cancel and modify need status 'pending'; L118 /
+   L130 return and exchange need 'delivered'; L110 after modify items
+   "the agent will not be able to modify or cancel the order anymore"
+   (the tool sets 'pending (item modified)'). C6 only checks that a
+   get_order_details happened; this reads what it returned.
+
+   Status is read from get_order_details and from every order write's
+   result (each returns the updated order). The rule denies when ANY
+   observed status differs from the required one. That equals "the
+   latest observed status differs" because no tau2 tool ever moves an
+   order back INTO 'pending' or 'delivered': address and payment
+   changes keep 'pending', every other write moves the order to a
+   status it never leaves. So no ordering of observations is needed.
+   'pending (item modified)' is not 'pending', so it blocks further
+   modify and cancel, as L110 says.
+   ═════════════════════════════════════════════════════════════════ */
+
+.decl OrderStatusObserved(order_id: symbol, status: symbol)
+OrderStatusObserved(oid, status) :-
+    Obs(_, fn, c),
+    (fn = "get_order_details";
+     fn = "cancel_pending_order";
+     fn = "modify_pending_order_address";
+     fn = "modify_pending_order_items";
+     fn = "modify_pending_order_payment";
+     fn = "return_delivered_order_items";
+     fn = "exchange_delivered_order_items"),
+    oid = @json_get_str(c, "order_id"),
+    oid != "",
+    status = @json_get_str(c, "status"),
+    status != "".
+
+// @deny_message: this order's status is not 'pending'; only a pending order can be cancelled or modified
+// @suggestion: Check the order status with get_order_details. Cancel and modify only apply to orders whose status is exactly 'pending' (an order whose items were already modified cannot be modified or cancelled again). Explain this to the user instead of retrying.
+Unauthorized(idx) :-
+    IsOrderModifyOrCancel(idx),
+    ToolOrderId(idx, oid),
+    OrderStatusObserved(oid, status),
+    status != "pending".
+
+// @deny_message: this order's status is not 'delivered'; only a delivered order can be returned or exchanged
+// @suggestion: Check the order status with get_order_details. Return and exchange only apply to orders whose status is 'delivered'. Explain this to the user instead of retrying.
+Unauthorized(idx) :-
+    IsDeliveredOrderWrite(idx),
+    ToolOrderId(idx, oid),
+    OrderStatusObserved(oid, status),
+    status != "delivered".
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C7 — modify_pending_order_items is one-shot per order, and locks
+        the order from further modify/cancel
+   ═════════════════════════════════════════════════════════════════ */
+
+// @deny_message: Order has already been items-modified; further modify/cancel actions are blocked
+// @suggestion: This order is locked after modify_pending_order_items; transfer to a human agent if more changes are needed
+Unauthorized(idx) :-
+    IsOrderModifyOrCancel(idx),
+    ToolOrderId(idx, oid),
+    OrderItemsAlreadyModified(oid).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C8 — Transfer protocol
+   ═════════════════════════════════════════════════════════════════ */
+
+// Tau2's reference monitor only intercepts tool calls (not text
+// SendAttempts), so we enforce the transfer protocol in two
+// tool-gate rules:
+//
+//   1. After a successful transfer_to_human_agents, no further tool
+//      calls are allowed — the agent's only remaining action should
+//      be to send the handoff message and end its turn.
+//   2. If the agent emits the handoff text via SendAttempt (a
+//      possible future deployment), it must be preceded by the
+//      transfer call. We bind `msg` via SentMessage(curr, _) so
+//      sugar.py can infer the Message record type.
+
+// @deny_message: After transfer_to_human_agents, no further tool calls are allowed
+// @suggestion: Send 'YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON.' as the final assistant turn and stop
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsToolCall(a),
+    TransferCalled().
+
+// @deny_message: Handoff message must be preceded by a successful transfer_to_human_agents call
+// @suggestion: Call transfer_to_human_agents first, then send 'YOU ARE BEING TRANSFERRED TO A HUMAN AGENT. PLEASE HOLD ON.'
+Unauthorized(idx) :-
+    Actions(idx, a),
+    a = $SendAttempt(_),
+    Current(curr),
+    SentMessage(curr, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $Assistant(),
+    @is_handoff_message(msg.contents) = 1,
+    !TransferCalled().
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C17 — Identifiers must come from the user or a tool
+
+   policy.md L18: "You should not make up any information ... not
+   provided by the user or the tools". An order_id, product_id or
+   item_id argument must appear in a user turn that reached the agent
+   or in the body of an executed tool result that is not an error
+   (an error body echoes the id the agent invented). Order ids are
+   '#W' plus 7 digits in the tools, but users often type them without
+   the '#': when the argument starts with '#', the rest of it also
+   grounds it. The reverse (argument without '#', text with it) is a
+   plain substring match already. `strlen(v) > 1` keeps a bare "#"
+   from stripping to the empty string, which every text contains.
+   Users also type only the digits ("9502127, I forgot the W"), so an
+   order_id of the form '#W' plus at least 5 digits is also grounded
+   when those digits appear in a user turn (not in tool results, which
+   print the full id).
+   Arrays (item_ids, new_item_ids) are checked by C12 instead.
+   ═════════════════════════════════════════════════════════════════ */
+
+.decl IdArg(idx: unsigned, v: symbol)
+IdArg(idx, v) :-
+    Actions(idx, a),
+    a = $CallTool(_, args),
+    (f = "order_id"; f = "product_id"; f = "item_id"),
+    v = @json_get_str(args, f),
+    v != "".
+
+.decl GroundingText(t: symbol)
+GroundingText(t) :-
+    CurrentDepends(mid),
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $UserRole(),
+    t = msg.contents.
+GroundingText(t) :-
+    Obs(_, _, t),
+    @str_starts_with(t, "Error") = 0.
+
+.decl IdGrounded(idx: unsigned, v: symbol)
+IdGrounded(idx, v) :-
+    IdArg(idx, v),
+    GroundingText(t),
+    @str_contains(t, v) = 1.
+IdGrounded(idx, v) :-
+    IdArg(idx, v),
+    strlen(v) > 1,
+    substr(v, 0, 1) = "#",
+    GroundingText(t),
+    @str_contains(t, substr(v, 1, strlen(v) - 1)) = 1.
+
+IdGrounded(idx, v) :-
+    Actions(idx, a),
+    a = $CallTool(_, args),
+    v = @json_get_str(args, "order_id"),
+    strlen(v) >= 7,
+    substr(v, 0, 2) = "#W",
+    digits = substr(v, 2, strlen(v) - 2),
+    CurrentDepends(mid),
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $UserRole(),
+    @str_contains(msg.contents, digits) = 1.
+
+// @deny_message: An identifier in this call was not provided by the user or returned by a tool
+// @suggestion: Use only order, product and item ids the user gave or a tool returned (for example from get_user_details, get_order_details or list_all_product_types). Look the id up first instead of guessing it.
+Unauthorized(idx) :-
+    IdArg(idx, v),
+    !IdGrounded(idx, v).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C18 — An address change must use an address from the user or a tool
+
+   policy.md L18. C17 covers identifiers only; an address the agent
+   makes up (it "recalls" an order address it never retrieved) and the
+   user then repeats back would pass a plain "appears in a user turn"
+   test. So the address1 value must appear, case-insensitively, in a
+   user turn or a non-error tool result that comes BEFORE the agent's
+   first mention of it (history order from HistIdx), or anywhere in
+   those sources when the agent never mentioned it.
+   ═════════════════════════════════════════════════════════════════ */
+
+.decl AddrArg(idx: unsigned, v: symbol)
+AddrArg(idx, v) :-
+    Actions(idx, a),
+    (IsTool(a, "modify_pending_order_address"); IsTool(a, "modify_user_address")),
+    a = $CallTool(_, args),
+    v = @str_to_lower(@json_get_str(args, "address1")),
+    v != "".
+
+.decl AddrAgentMention(v: symbol, k: number)
+AddrAgentMention(v, k) :-
+    AddrArg(_, v),
+    CurrentDepends(mid),
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $Assistant(),
+    HistIdx(mid, k),
+    @str_contains(@str_to_lower(msg.contents), v) = 1.
+
+.decl AddrSourceMention(v: symbol, k: number)
+AddrSourceMention(v, k) :-
+    AddrArg(_, v),
+    CurrentDepends(mid),
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $UserRole(),
+    HistIdx(mid, k),
+    @str_contains(@str_to_lower(msg.contents), v) = 1.
+AddrSourceMention(v, k) :-
+    AddrArg(_, v),
+    Obs(rid, _, t),
+    @str_starts_with(t, "Error") = 0,
+    HistIdx(rid, k),
+    @str_contains(@str_to_lower(t), v) = 1.
+
+.decl AddrFirstAgentMention(v: symbol, m: number)
+AddrFirstAgentMention(v, m) :-
+    AddrAgentMention(v, _),
+    m = min k : AddrAgentMention(v, k).
+
+.decl AddrGrounded(idx: unsigned)
+AddrGrounded(idx) :-
+    AddrArg(idx, v),
+    AddrSourceMention(v, _),
+    !AddrAgentMention(v, _).
+AddrGrounded(idx) :-
+    AddrArg(idx, v),
+    AddrSourceMention(v, k),
+    AddrFirstAgentMention(v, m),
+    k < m.
+
+// @deny_message: The new address was not provided by the user or returned by a tool before the agent stated it
+// @suggestion: Ask the user for the full new address (or read it from a tool result) instead of proposing one, then list it back for confirmation.
+Unauthorized(idx) :-
+    AddrArg(idx, _),
+    !AddrGrounded(idx).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C19 — A payment-method change must change the method
+
+   policy.md L102: "The user can only choose a single payment method
+   different from the original payment method." Denied when the new
+   payment_method_id equals the order's original one (from a retrieved
+   get_order_details). Whether the method is in the profile, and a gift
+   card's balance, are C10/C11.
+   ═════════════════════════════════════════════════════════════════ */
+
+// @deny_message: The new payment method is the order's original payment method
+// @suggestion: A payment change must use a different payment method from the user's profile. Ask the user which other method they want.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_payment"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    pm = @json_get_str(args, "payment_method_id"),
+    pm != "",
+    OrderOriginalPayment(oid, pm).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C10 — Which payment method a price difference or refund may use
+
+   modify_pending_order_items / exchange_delivered_order_items
+   (policy.md L114/L134: "The user must provide a payment method to
+   pay or receive refund of the price difference"): golds default to
+   the original payment method when the user does not name a
+   different one. So a non-original payment_method_id is denied
+   UNLESS the user mentioned a payment-method type earlier in the
+   conversation — the keyword stands in for "the user provided it".
+
+   return_delivered_order_items (policy.md L124: "The refund must
+   either go to the original payment method, or an existing gift
+   card"): the destination must be the order's payment_history[0]
+   method or a gift_card_* that exists in the authenticated user's
+   get_user_details profile. There is NO keyword exception here: a
+   user who asks for a refund to PayPal when the order was paid by
+   card must be told no (the tau2 tool rejects that call too). The
+   rule is written deny-unless-allowed, so a missing order or profile
+   lookup denies rather than letting the call through.
+
+   The C6 prerequisite already enforces a prior get_order_details so
+   OrderOriginalPayment binds for in-spec calls.
+   ═════════════════════════════════════════════════════════════════ */
+
+// True when the user has mentioned a payment-method term or a
+// specific payment_method_id in their messages within the slice.
+// Used to carve out C10 — if the user explicitly named a non-default
+// payment method, the agent honoring that request is in-spec.
+//
+// Match is case-insensitive (via @str_to_lower) and covers:
+//   - the three retail policy.md categories: "gift card", "paypal",
+//     "credit card"
+//   - common credit-card brand aliases: "visa", "mastercard" /
+//     "master card", "amex" / "american express", "discover"
+//   - "debit" (debit cards are listed alongside credit cards in some
+//     user payment_methods objects)
+//   - "certificate" (used in airline-style flows that still hit this
+//     rule via shared write-tool gates)
+.decl UserMentionedPaymentMethod()
+UserMentionedPaymentMethod() :-
+    CurrentDepends(mid),
+    SentMessage(mid, msg),
+    msg.agent = "LLMAgent",
+    msg.agent_role = $UserRole(),
+    lc = @str_to_lower(msg.contents),
+    (@str_contains(lc, "gift card") = 1;
+     @str_contains(lc, "paypal") = 1;
+     @str_contains(lc, "credit card") = 1;
+     @str_contains(lc, "visa") = 1;
+     @str_contains(lc, "mastercard") = 1;
+     @str_contains(lc, "master card") = 1;
+     @str_contains(lc, "amex") = 1;
+     @str_contains(lc, "american express") = 1;
+     @str_contains(lc, "discover") = 1;
+     @str_contains(lc, "debit") = 1;
+     @str_contains(lc, "certificate") = 1).
+
+// True when the user's CURRENT (latest) turn positively selects a
+// specific payment_method_id in an immediate-selection clause,
+// scoped to the candidate action's order when the selection names one.
+//
+// Bound to the latest user turn only (LatestUserTurnIdx / UserTurnAt).
+// A compound selection that names an order (e.g. "exchanging both items
+// on order #W5838674 and charge ... to gift_card_X") is scoped: it
+// only admits gift_card_X for order #W5838674, not for other orders.
+// A simple selection without an order (e.g. "Please use gift_card_X")
+// admits the payment method for any order.
+//
+// The generic keyword relation (UserMentionedPaymentMethod) is retained
+// for backward compatibility. It is a broad keyword approximation that
+// fires on "gift card" / "credit card" without binding to a specific
+// ID, owned profile, or current-turn scope.
+
+// Simple (unscoped) exact-ID selection: no order named in the message.
+.decl UserSelectedExactPaymentId(pm: symbol)
+UserSelectedExactPaymentId(pm) :-
+    CandidatePm(pm),
+    pm != "",
+    LatestUserTurnIdx(k),
+    UserTurnAt(mid, k),
+    SentMessage(mid, msg),
+    @user_selected_payment_id(msg.contents, pm) = 1,
+    @user_selected_payment_order(msg.contents, pm) = "",
+    AuthProfile(_, c),
+    @json_object_has_key(c, "payment_methods", pm) = 1.
+
+// Order-scoped exact-ID selection: the message names a specific order.
+// The named order must match the candidate action's order_id (compared
+// lowercase, with leading '#').
+.decl UserSelectedExactPaymentIdForOrder(pm: symbol, oid: symbol)
+UserSelectedExactPaymentIdForOrder(pm, oid) :-
+    CandidatePm(pm),
+    pm != "",
+    LatestUserTurnIdx(k),
+    UserTurnAt(mid, k),
+    SentMessage(mid, msg),
+    @user_selected_payment_id(msg.contents, pm) = 1,
+    named = @user_selected_payment_order(msg.contents, pm),
+    named != "",
+    Actions(_, a),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    oid != "",
+    @str_to_lower(oid) = named,
+    AuthProfile(_, c),
+    @json_object_has_key(c, "payment_methods", pm) = 1.
+
+// @deny_message: payment_method_id does not match the order's original payment method; refunds must go to the original method (unless the user requested a different method)
+// @suggestion: Use the payment_method_id returned in get_order_details.payment_history[0]; if the user requests a different method, honor that request
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_items"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    used = @json_get_str(args, "payment_method_id"),
+    used != "",
+    OrderOriginalPayment(oid, original),
+    used != original,
+    !UserMentionedPaymentMethod(),
+    !UserSelectedExactPaymentId(used),
+    !UserSelectedExactPaymentIdForOrder(used, oid).
+
+// The authenticated user's profile as returned by get_user_details
+// (the body's own user_id must be an authenticated id, so a profile
+// of some other customer never counts).
+.decl AuthProfile(rid: symbol, contents: symbol)
+AuthProfile(rid, c) :-
+    Obs(rid, "get_user_details", c),
+    uid = @json_get_str(c, "user_id"),
+    uid != "",
+    AuthenticatedUserId(uid).
+
+// A gift card that exists in the authenticated user's profile.
+.decl AuthProfileGiftCard(pm: symbol)
+AuthProfileGiftCard(pm) :-
+    CandidatePm(pm),
+    @str_starts_with(pm, "gift_card_") = 1,
+    AuthProfile(_, c),
+    @json_object_has_key(c, "payment_methods", pm) = 1.
+
+// @deny_message: a return refund must go to the order's original payment method or to an existing gift card of the user
+// @suggestion: Refund to the payment_method_id in get_order_details.payment_history[0], or to a gift card listed in the user's get_user_details payment_methods (look the profile up first). No other destination is allowed, even if the user asks for one; explain this to the user.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "return_delivered_order_items"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    used = @json_get_str(args, "payment_method_id"),
+    !OrderOriginalPayment(oid, used),
+    !AuthProfileGiftCard(used).
+
+// @deny_message: payment_method_id does not match the order's original payment method; refunds must go to the original method (unless the user requested a different method)
+// @suggestion: Use the payment_method_id returned in get_order_details.payment_history[0]; if the user requests a different method, honor that request
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "exchange_delivered_order_items"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    used = @json_get_str(args, "payment_method_id"),
+    used != "",
+    OrderOriginalPayment(oid, original),
+    used != original,
+    !UserMentionedPaymentMethod(),
+    !UserSelectedExactPaymentId(used),
+    !UserSelectedExactPaymentIdForOrder(used, oid).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   Bounded index relation (used by C12; could be promoted to common
+   policy if other domains need it). Bound 32 covers all retail
+   item lists in the eval set with comfortable headroom.
+   ═════════════════════════════════════════════════════════════════ */
+.decl Indices(i: unsigned)
+Indices(0).
+Indices(i + 1) :- Indices(i), i < 32.
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C12 — Modify/exchange item checks (fail-closed)
+
+   policy.md L112 / L132: "each item can be modified/exchanged to an
+   available new item of the same product but of different product
+   option". For every position p of the call:
+     • item_ids[p] must be an item of THIS order, read from the
+       order's own get_order_details result;
+     • new_item_ids[p] must be a key of .variants in the
+       get_product_details result of THAT item's product, and that
+       variant's "available" must be true.
+   item_ids must be non-empty and new_item_ids must have the same
+   length. A missing lookup denies (the rule is deny-unless-verified),
+   so an exchange into a product that was never looked up, or of an
+   item that is not in the order, cannot slip through. C13 below
+   handles new == old.
+   ═════════════════════════════════════════════════════════════════ */
+
+// Every (position, old, new) pair of a modify/exchange call, with the
+// call's order id. Empty strings are kept (a non-string or missing
+// element) so that they fail verification instead of vanishing.
+.decl ItemPairAt(idx: unsigned, p: unsigned, order_id: symbol, old_id: symbol, new_id: symbol)
+ItemPairAt(idx, p, oid, old_id, new_id) :-
+    Actions(idx, a),
+    (IsTool(a, "modify_pending_order_items"); IsTool(a, "exchange_delivered_order_items")),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    n = @json_array_len(args, "item_ids"),
+    Indices(p),
+    p < n,
+    old_id = @json_array_get_str(args, "item_ids", p),
+    new_id = @json_array_get_str(args, "new_item_ids", p).
+
+// Kept for C13 (same-variant swap), which predates C12's rewrite.
+.decl ModifyItemPair(idx: unsigned, position: unsigned, old_id: symbol, new_id: symbol)
+ModifyItemPair(idx, p, old_id, new_id) :-
+    ItemPairAt(idx, p, _, old_id, new_id),
+    old_id != "",
+    new_id != "".
+
+// An item of an order, per a get_order_details result for it: the
+// item's product and its price in cents.
+.decl OrderItem(order_id: symbol, item_id: symbol, product_id: symbol, cents: number)
+OrderItem(oid, item_id, pid, cents) :-
+    Obs(_, "get_order_details", c),
+    oid = @json_get_str(c, "order_id"),
+    oid != "",
+    n = @json_array_len(c, "items"),
+    Indices(i),
+    i < n,
+    item_id = @json_array_get_field_str(c, "items", i, "item_id"),
+    item_id != "",
+    pid = @json_array_get_field_str(c, "items", i, "product_id"),
+    pid != "",
+    cents = @json_path_cents(c, cat("items[", to_string(as(i, number)), "].price")).
+
+// A variant of a product, per a get_product_details result: whether
+// it is available (1/0) and its price in cents. Anchored on the new
+// item ids of the call so only those keys are probed.
+.decl ProductVariant(product_id: symbol, item_id: symbol, available: unsigned, cents: number)
+ProductVariant(pid, v, avail, cents) :-
+    ItemPairAt(_, _, _, _, v),
+    v != "",
+    Obs(_, "get_product_details", c),
+    pid = @json_get_str(c, "product_id"),
+    pid != "",
+    @json_object_has_key(c, "variants", v) = 1,
+    avail = @json_path_is_true(c, cat("variants.", v, ".available")),
+    cents = @json_path_cents(c, cat("variants.", v, ".price")).
+
+// Position p verified: old item in this order, new item an available
+// variant of the old item's product. `delta` is new − old price.
+.decl ItemPairVerified(idx: unsigned, p: unsigned, delta: number)
+ItemPairVerified(idx, p, delta) :-
+    ItemPairAt(idx, p, oid, old_id, new_id),
+    OrderItem(oid, old_id, pid, old_cents),
+    ProductVariant(pid, new_id, 1, new_cents),
+    old_cents >= 0,
+    new_cents >= 0,
+    delta = new_cents - old_cents.
+
+.decl ItemPairOk(idx: unsigned, p: unsigned)
+ItemPairOk(idx, p) :- ItemPairVerified(idx, p, _).
+
+// Item-list lengths of a modify/exchange call.
+.decl ItemChangeLens(idx: unsigned, n: unsigned, m: unsigned)
+ItemChangeLens(idx, n, m) :-
+    Actions(idx, a),
+    (IsTool(a, "modify_pending_order_items"); IsTool(a, "exchange_delivered_order_items")),
+    a = $CallTool(_, args),
+    n = @json_array_len(args, "item_ids"),
+    m = @json_array_len(args, "new_item_ids").
+
+// @deny_message: item_ids must be a non-empty list and new_item_ids must have the same length
+// @suggestion: Collect every item to change into item_ids, with the replacement for each at the same position in new_item_ids, and make the call once.
+Unauthorized(idx) :-
+    ItemChangeLens(idx, n, m),
+    (n = 0; n != m).
+
+// A product whose get_product_details result is in the history.
+.decl ProductRead(product_id: symbol)
+ProductRead(pid) :-
+    Obs(_, "get_product_details", c),
+    pid = @json_get_str(c, "product_id"),
+    pid != "".
+
+// Position p cannot be verified only because the old item's product
+// has not been looked up yet: the old item is in the order, and no
+// get_product_details for its product is in the history. This gets
+// its own message, because "not available" would tell the agent the
+// user's chosen item is wrong when it has simply not been checked.
+.decl ItemPairUnread(idx: unsigned, p: unsigned)
+ItemPairUnread(idx, p) :-
+    ItemPairAt(idx, p, oid, old_id, _),
+    OrderItem(oid, old_id, pid, _),
+    !ProductRead(pid).
+
+// @deny_message: a new item's availability has not been checked yet: get_product_details has not been called for the product of the item being changed
+// @suggestion: Call get_product_details for that product (its product_id is in get_order_details). If the new item is listed there with "available": true, retry this same call unchanged; the user's confirmation still applies. Only if it is unavailable, tell the user and ask them to choose again.
+Unauthorized(idx) :-
+    ItemPairAt(idx, p, _, _, _),
+    !ItemPairOk(idx, p),
+    ItemPairUnread(idx, p).
+
+// @deny_message: an item is not in this order, or its replacement is not an available variant of the same product
+// @suggestion: Call get_order_details for the order and get_product_details for each item's product first. Each item must be in the order, and each new item must be a variant of that same product whose "available" is true.
+Unauthorized(idx) :-
+    ItemPairAt(idx, p, _, _, _),
+    !ItemPairOk(idx, p),
+    !ItemPairUnread(idx, p).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C11 — Gift-card balance must cover what the user PAYS
+
+   policy.md L104 (modify payment): "If the user wants the modify the
+   payment method to gift card, it must have enough balance to cover
+   the total amount." L114 / L134 (modify items, exchange): "If the
+   user provides a gift card, it must have enough balance to cover
+   the price difference." Only a PAYING direction needs balance. A
+   refund INTO a gift card (a return, or a cheaper replacement) is
+   allowed whatever the balance — L124 only asks that the gift card
+   exist.
+
+   Amount owed:
+     • modify_pending_order_payment: payment_history[0].amount of
+       the order (what the tau2 tool charges to the new method);
+     • modify_pending_order_items / exchange_delivered_order_items:
+       the sum over positions of (new variant price − old item
+       price), when that sum is positive. It is computed from C12's
+       verified pairs, so it is only known when C12 passes.
+   Balance: the gift card's .balance in the authenticated user's
+   get_user_details result. With several snapshots the latest one
+   (highest message_index) wins, because balances move during a
+   conversation (refunds to a gift card land immediately). All money
+   is compared in cents. No snapshot → deny: the agent has to look the
+   balance up before charging a gift card.
+   ═════════════════════════════════════════════════════════════════ */
+
+.decl GcBalanceSnap(rid: symbol, pm: symbol, cents: number)
+GcBalanceSnap(rid, pm, cents) :-
+    CandidatePm(pm),
+    @str_starts_with(pm, "gift_card_") = 1,
+    AuthProfile(rid, c),
+    cents = @json_path_cents(c, cat("payment_methods.", pm, ".balance")),
+    cents >= 0.
+
+.decl GcSnapSuperseded(rid: symbol, pm: symbol)
+GcSnapSuperseded(rid, pm) :-
+    GcBalanceSnap(rid, pm, _),
+    HistIdx(rid, k),
+    GcBalanceSnap(r2, pm, _),
+    HistIdx(r2, k2),
+    k2 > k.
+
+.decl GcBalance(pm: symbol, cents: number)
+GcBalance(pm, cents) :-
+    GcBalanceSnap(rid, pm, cents),
+    !GcSnapSuperseded(rid, pm).
+
+.decl GcBalanceKnown(pm: symbol)
+GcBalanceKnown(pm) :- GcBalance(pm, _).
+
+// The order total charged to the original method (payment_history[0]).
+.decl OrderPaidCents(order_id: symbol, cents: number)
+OrderPaidCents(oid, cents) :-
+    Obs(_, "get_order_details", c),
+    oid = @json_get_str(c, "order_id"),
+    oid != "",
+    cents = @json_path_cents(c, "payment_history[0].amount"),
+    cents >= 0.
+
+// Price difference of a modify/exchange call, known only when every
+// position verified (one delta per position; `min` collapses repeated
+// observations of the same prices).
+.decl ItemPairDelta(idx: unsigned, p: unsigned, delta: number)
+ItemPairDelta(idx, p, d) :-
+    ItemPairOk(idx, p),
+    d = min dd : { ItemPairVerified(idx, p, dd) }.
+
+.decl ItemChangeDiff(idx: unsigned, diff: number)
+ItemChangeDiff(idx, diff) :-
+    ItemChangeLens(idx, n, n),
+    n > 0,
+    cnt = count : { ItemPairDelta(idx, _, _) },
+    cnt = as(n, number),
+    diff = sum d : { ItemPairDelta(idx, _, d) }.
+
+// (call, gift card, cents owed) for every paying use of a gift card.
+.decl GiftCardOwed(idx: unsigned, pm: symbol, owed: number)
+GiftCardOwed(idx, pm, owed) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_payment"),
+    a = $CallTool(_, args),
+    pm = @json_get_str(args, "payment_method_id"),
+    @str_starts_with(pm, "gift_card_") = 1,
+    oid = @json_get_str(args, "order_id"),
+    OrderPaidCents(oid, owed),
+    owed > 0.
+GiftCardOwed(idx, pm, owed) :-
+    Actions(idx, a),
+    (IsTool(a, "modify_pending_order_items"); IsTool(a, "exchange_delivered_order_items")),
+    a = $CallTool(_, args),
+    pm = @json_get_str(args, "payment_method_id"),
+    @str_starts_with(pm, "gift_card_") = 1,
+    ItemChangeDiff(idx, owed),
+    owed > 0.
+
+// @deny_message: the gift card's balance does not cover the amount the user has to pay
+// @suggestion: Check the gift card balance with get_user_details. A gift card can only pay when its balance covers the full amount (the order total for a payment change, the price difference for a modify or exchange); otherwise ask the user for another payment method.
+Unauthorized(idx) :-
+    GiftCardOwed(idx, pm, owed),
+    GcBalance(pm, balance),
+    balance < owed.
+
+// @deny_message: the gift card's balance has not been checked in this conversation
+// @suggestion: Call get_user_details for the authenticated user to read the gift card balance before charging it, then retry only if the balance covers the amount.
+Unauthorized(idx) :-
+    GiftCardOwed(idx, pm, _),
+    !GcBalanceKnown(pm).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C13 — exchange/modify pairs must change the item
+
+   An exchange or modification where new_item_ids[i] == item_ids[i]
+   is a no-op (same variant for same variant). Tau2 retail policy
+   treats this as not-an-exchange and refuses it; the agent must
+   pick a different variant or offer a different fallback (e.g. the
+   32GB version when the user asks for "the same e-reader").
+   ═════════════════════════════════════════════════════════════════ */
+
+// @deny_message: exchange/modify new_item_ids must differ from item_ids at every position; same-variant swap is a no-op
+// @suggestion: Remove unchanged pairs (where new_item_ids[i] == item_ids[i]) from both lists and retry with only the pairs whose items actually change. Do not invent replacements for the removed pairs — only include pairs the user selected. If no changed pairs remain after removal, do not retry a write; explain to the user that the requested items are already the current variants.
+Unauthorized(idx) :-
+    ModifyItemPair(idx, _, old_id, new_id),
+    old_id = new_id.
+
+
+/* ═════════════════════════════════════════════════════════════════
+   C14 — No further writes on an order after a status-changing write
+
+   τ2's retail policy distinguishes:
+     • Locking writes (change order status, terminal):
+         cancel_pending_order        → cancelled
+         modify_pending_order_items  → pending (items modified)
+         return_delivered_order_items → return requested
+         exchange_delivered_order_items → exchange requested
+     • Non-locking writes (status stays pending):
+         modify_pending_order_address
+         modify_pending_order_payment
+
+   policy.md already documents the modify_items lock explicitly. The
+   other status-changing writes implicitly lock too (you can't modify
+   a cancelled / returned / exchanged order). So once any locking
+   write succeeds, ALL further writes on that order — including
+   non-locking address/payment changes — are denied.
+
+   Non-locking writes do NOT lock — modify_address followed by
+   modify_items on the same pending order is in-spec (and required
+   by tasks like retail-41 where the user fixes the address before
+   swapping items).
+
+   ToolResult is only emitted for authorized + executed calls, so a
+   blocked-then-retried sequence naturally only counts the retry —
+   if C13 blocks a same-item exchange, the retry with a real swap
+   is the one that locks the order.
+   ═════════════════════════════════════════════════════════════════ */
+
+// True when a status-changing (locking) write tool has succeeded on
+// this order_id earlier in the slice.
+.decl OrderHasLockingWrite(order_id: symbol)
+OrderHasLockingWrite(order_id) :-
+    CurrentDepends(rid),
+    ToolResult(rid, fn, _),
+    (fn = "cancel_pending_order";
+     fn = "modify_pending_order_items";
+     fn = "return_delivered_order_items";
+     fn = "exchange_delivered_order_items"),
+    Edge(src, rid),
+    SentMessage(src, src_msg),
+    src_msg.agent = "LLMAgent",
+    SentMessage(rid, rmsg),
+    order_id = @json_get_str(rmsg.contents, "order_id"),
+    order_id != "".
+
+// @deny_message: this order's status has already been changed by a prior write in this conversation (cancel / modify_items / return / exchange); no further writes on this order are allowed
+// @suggestion: Do not issue further writes against this order. Communicate the change you already made and continue with other authorized requests on different orders.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "cancel_pending_order"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    OrderHasLockingWrite(oid).
+
+// @deny_message: this order's status has already been changed by a prior write in this conversation (cancel / modify_items / return / exchange); no further writes on this order are allowed
+// @suggestion: Do not issue further writes against this order. Communicate the change you already made and continue with other authorized requests on different orders.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_items"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    OrderHasLockingWrite(oid).
+
+// @deny_message: this order's status has already been changed by a prior write in this conversation (cancel / modify_items / return / exchange); no further writes on this order are allowed
+// @suggestion: Do not issue further writes against this order. Communicate the change you already made and continue with other authorized requests on different orders.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_address"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    OrderHasLockingWrite(oid).
+
+// @deny_message: this order's status has already been changed by a prior write in this conversation (cancel / modify_items / return / exchange); no further writes on this order are allowed
+// @suggestion: Do not issue further writes against this order. Communicate the change you already made and continue with other authorized requests on different orders.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "modify_pending_order_payment"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    OrderHasLockingWrite(oid).
+
+// @deny_message: this order's status has already been changed by a prior write in this conversation (cancel / modify_items / return / exchange); no further writes on this order are allowed
+// @suggestion: Do not issue further writes against this order. Communicate the change you already made and continue with other authorized requests on different orders.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "return_delivered_order_items"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    OrderHasLockingWrite(oid).
+
+// @deny_message: this order's status has already been changed by a prior write in this conversation (cancel / modify_items / return / exchange); no further writes on this order are allowed
+// @suggestion: Do not issue further writes against this order. Communicate the change you already made and continue with other authorized requests on different orders.
+Unauthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "exchange_delivered_order_items"),
+    a = $CallTool(_, args),
+    oid = @json_get_str(args, "order_id"),
+    OrderHasLockingWrite(oid).
+
+
+/* ═════════════════════════════════════════════════════════════════
+   Known structural limitations
+   ═════════════════════════════════════════════════════════════════
+   What the rules above do NOT enforce, or enforce only in part:
+
+     • L18 "You should not make up any information ... or give
+       subjective recommendations or comments": C17 covers made-up
+       order / product / item ids only. Other invented facts and
+       subjective comments are content semantics (an LLM oracle,
+       ruled out by the determinism constraint). C17 matches by
+       substring, so a truncated id contained in a real one is
+       grounded; the tool then rejects it.
+     • L16 confirmation: C4 requires the user's latest turn to be a
+       yes, and C4b stops a modify/exchange call from switching to
+       items the user did not confirm. A prior YES can preserve
+       modify_pending_order_address and modify_pending_order_items
+       across a whitelisted information-only interjection (tracking
+       or status question), but ONLY when: the agent's proposal
+       contains an unconditional structured section for that
+       specific action (address-change section or item-change
+       section with "from X to Y"); every address field (including
+       address2) matches the authenticated user's profile address;
+       every distinguishing option value of the new item variant
+       appears in the "to" clause of the proposal (not anywhere in
+       the text); and the payment method matches the order's
+       original. All other writes (cancel, payment change, return,
+       exchange, profile-address) require the latest turn to be a
+       YES. The item-change check requires a "from ... to ..."
+       structure in the proposal; other phrasings fail closed.
+     • L20 (one tool call at a time, and no text in the same turn as a
+       tool call) is not enforced: several calls in one turn, including
+       several writes, and text sent together with a call are allowed.
+       Calls issued together are each checked against the conversation
+       as it stood before any of them ran.
+     • L24 "transfer ... if and only if the request cannot be
+       handled" is not checked. C8a stops tool calls after a
+       successful transfer; C8b (the handoff text needs a prior
+       transfer) triggers only on $SendAttempt, which the tau2
+       instrumentation never checks, so it is inactive there.
+     • C5b's "agent proposed the reason, user agreed" branch reads the
+       tau2 UserSimulator's flipped copy of the agent's message.
+       Without that mirror only the user's own wording of the reason
+       settles it.
+     • L102 (modify payment: a single method different from the
+       original, from the user's profile) has no rule; the tau2 tool
+       rejects both violations. C11 checks only the gift-card balance.
+     • L114 / L134 "The user must provide a payment method": C10
+       approximates "provided" by a payment keyword in a user turn
+       (gift card, paypal, credit card, card brands).
+     • The reminders ("remind the customer to confirm they have
+       provided all items") are not enforced. Return item lists are
+       not checked against the order (the tool rejects unknown items).
+     • C3b guards order WRITES. The first get_order_details of another
+       customer's order is not blocked while only one user has been
+       authenticated (its owner is only known from the result).
+     • C11 reads the balance from the latest get_user_details read and
+       does not adjust it for a later write in the same conversation.
+       A write that spent the card after that read can leave the check
+       comparing against a stale, higher balance; the tau2 tool itself
+       rejects a payment the card cannot cover.
+
+   The τ2-bench tool bodies also reject several of these at execution
+   time (non-pending modify, non-original refund, insufficient gift
+   card, unavailable variant); the rules here deny them before the
+   tool runs and tell the agent why.
+   ═════════════════════════════════════════════════════════════════ */

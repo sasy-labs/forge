@@ -1,0 +1,58 @@
+/* MLS/Bell-LaPadula Policy (Soufflé) — information flow control */
+
+// Custom functors declared (implemented in functors.cpp)
+.functor file_security_level(path: symbol): number stateful
+.functor entity_clearance(entity: symbol): number stateful
+.functor recipient_clearance(email: symbol): number stateful
+
+/* Bell-LaPadula: No Write Down */
+
+// @deny_message: Cannot send email - recipient clearance may be insufficient
+// @suggestion: Verify the recipient has appropriate clearance
+// @tool_pattern: send_email
+IsAuthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "send_email"),
+    Principal(entity),
+    a = $CallTool(_, args),
+    @recipient_clearance(@json_get_str(args, "to")) >= @entity_clearance(entity).
+
+/* Bell-LaPadula: No Read Up */
+
+// @deny_message: Cannot read file - the file's security level exceeds your clearance
+// @suggestion: Skip this file and use only files at or below your clearance level; do not retry the same path
+// @tool_pattern: read_file
+IsAuthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "read_file"),
+    Principal(entity),
+    a = $CallTool(_, args),
+    @entity_clearance(entity) >= @file_security_level(@json_get_str(args, "path")).
+
+// @deny_message: Cannot list files - max_security_level exceeds your clearance
+// @suggestion: Retry list_files with a lower max_security_level (no greater than your clearance level)
+// @tool_pattern: list_files
+IsAuthorized(idx) :-
+    Actions(idx, a),
+    IsTool(a, "list_files"),
+    Principal(entity),
+    a = $CallTool(_, args),
+    @json_get_int(args, "max_security_level") <= @entity_clearance(entity).
+
+// Tool calls that aren't gated by MLS pass through (e.g.
+// ``recipient_message`` for sub-task routing). The rules above
+// only carve out the three security-relevant ops; without this
+// catch-all every other tool is denied by omission, which
+// silently broke the multi-agent scenario's ``recipient_message``
+// call.
+IsAuthorized(idx) :-
+    Actions(idx, a), IsToolCall(a),
+    !IsTool(a, "send_email"),
+    !IsTool(a, "read_file"),
+    !IsTool(a, "list_files").
+
+// Non-tool: pass through
+IsAuthorized(idx) :- Actions(idx, a), !IsToolCall(a), !QueriesHost(a, "api.openai.com").
+IsAuthorized(idx) :- Actions(idx, a), QueriesHost(a, "api.openai.com"), HasRole("openai-access").
+
+ApplyTransform(idx, "inject_openai_key") :- Actions(idx, a), QueriesHost(a, "api.openai.com"), Authorized(idx).

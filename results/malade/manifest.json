@@ -1,0 +1,147 @@
+{
+  "timestamp": "2026-10-08T12-59-36",
+  "run_dir": ".",
+  "targets": [
+    "malade"
+  ],
+  "domains": [
+    "airline",
+    "retail"
+  ],
+  "modes": [
+    "enforce-off",
+    "enforce-on"
+  ],
+  "models": [
+    "opus",
+    "gpt",
+    "gemini"
+  ],
+  "model_strings": {
+    "opus": "vertex_ai/claude-opus-4-5@20251101",
+    "gpt": "azure/gpt-5.2",
+    "gemini": "vertex_ai/gemini-3.1-pro-preview"
+  },
+  "user_llm": "azure/gpt-5.2",
+  "num_trials": 4,
+  "max_concurrency": 32,
+  "task_ids": "all",
+  "nl_judge_model": "vertex_ai/claude-opus-4-5@20251101",
+  "agentdojo": {
+    "provider": "azure",
+    "deployment": "gpt-4o",
+    "model_label": "gpt-4o-2024-08-06",
+    "attack": "tool_knowledge",
+    "version": "v1.2.2",
+    "presets": [
+      "none",
+      "none-rep",
+      "tool-filter",
+      "tool-filter-rep",
+      "ifc",
+      "ifc-rep",
+      "provenance",
+      "provenance-rep"
+    ],
+    "repeats": 5,
+    "threads": 32,
+    "suites": "all",
+    "user_tasks": "all",
+    "injection_tasks": "all",
+    "logdir": "agentdojo/runs"
+  },
+  "example_num_trials": 5,
+  "example_max_concurrency": 5,
+  "retry_infrastructure_errors": false,
+  "start_server": true,
+  "backend": {
+    "data_dir": "server-data",
+    "url": "localhost:11089",
+    "binary": "<implementation>/target/release/sasy"
+  },
+  "latency_capture": {
+    "version": 1,
+    "enabled": true,
+    "server_log": "server_latency.jsonl",
+    "graph_state": "persisted-at-stop",
+    "state": "stopped",
+    "engine_sha256": "ca43e79541a86103ceba3f788aeb5ee8f057c15e29fceaba4b27fe5ba3071e0f"
+  },
+  "warmups": [],
+  "cells": [
+    {
+      "id": "malade/instr",
+      "target": "malade",
+      "instrumented": true,
+      "policy": "examples/malade/malade_policy.dl",
+      "cert": "medical-client",
+      "command": [
+        "uv",
+        "run",
+        "python",
+        "examples/malade/malade/omop_observability.py",
+        "--trials",
+        "5",
+        "--max_concurrency",
+        "5",
+        "--concurrency_mode",
+        "processes",
+        "--instrumented",
+        "True",
+        "--nl_policy",
+        "False",
+        "--cache_path",
+        "malade_instr/results.json",
+        "--env_credentials",
+        "True"
+      ],
+      "env": {
+        "TLS_CERT_PATH": "<local-path>",
+        "TLS_KEY_PATH": "<local-path>"
+      },
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 223.2,
+      "results_path": "malade_instr/results.json"
+    },
+    {
+      "id": "malade/nl",
+      "target": "malade",
+      "instrumented": false,
+      "policy": "examples/malade/malade_policy.dl",
+      "cert": "medical-client",
+      "command": [
+        "uv",
+        "run",
+        "python",
+        "examples/malade/malade/omop_observability.py",
+        "--trials",
+        "5",
+        "--max_concurrency",
+        "5",
+        "--concurrency_mode",
+        "processes",
+        "--instrumented",
+        "False",
+        "--nl_policy",
+        "True",
+        "--cache_path",
+        "malade_nl/results.json",
+        "--env_credentials",
+        "True"
+      ],
+      "env": {
+        "TLS_CERT_PATH": "<local-path>",
+        "TLS_KEY_PATH": "<local-path>"
+      },
+      "unset": [
+        "SASY_POLICY_PATH"
+      ],
+      "returncode": 0,
+      "wall_s": 202.5,
+      "results_path": "malade_nl/results.json"
+    }
+  ]
+}

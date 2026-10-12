@@ -1,0 +1,93 @@
+\begin{table*}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{@{}l *{8}{c}@{}}
+\toprule
+& \multicolumn{4}{c}{\textbf{Without Repeat User Prompt}}
+& \multicolumn{4}{c}{\textbf{With Repeat User Prompt}} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-9}
+& \textbf{Task} & \textbf{Utility} & \textbf{ASR} & \textbf{ASR} & \textbf{Task} & \textbf{Utility} & \textbf{ASR} & \textbf{ASR} \\
+\textbf{Configuration}
+& \textbf{Utility} & \textbf{Under Attack} & \textbf{(AgentDojo)} & \textbf{(State)} & \textbf{Utility} & \textbf{Under Attack} & \textbf{(AgentDojo)} & \textbf{(State)} \\
+\midrule
+No runtime defense
+& $79.0 \pm 2.02$
+& $56.9 \pm 1.43$
+& $25.2 \pm 1.12$
+& $24.0 \pm 1.16$
+& $83.7 \pm 0.41$
+& $72.5 \pm 0.81$
+& $14.1 \pm 0.46$
+& $13.0 \pm 0.50$ \\
+Tool-call filter
+& $72.4 \pm 2.39$
+& $63.5 \pm 0.83$
+& $4.2 \pm 0.18$
+& $4.3 \pm 0.18$
+& $73.4 \pm 3.35$
+& $69.5 \pm 0.74$
+& $3.1 \pm 0.48$
+& $3.1 \pm 0.49$ \\
+FORGE (FIDES IFC Policy)
+& $32.2 \pm 2.39$
+& $31.0 \pm 0.55$
+& $1.5 \pm 0.40$
+& $1.0 \pm 0.42$
+& $33.2 \pm 1.89$
+& $34.4 \pm 0.51$
+& $0.6 \pm 0.12$
+& $0.3 \pm 0.20$ \\
+FORGE (provenance policy)
+& $57.3 \pm 3.49$
+& $49.4 \pm 0.59$
+& $1.7 \pm 0.31$
+& $0.9 \pm 0.15$
+& $62.5 \pm 1.40$
+& $63.8 \pm 0.91$
+& $0.9 \pm 0.30$
+& $0.2 \pm 0.12$ \\
+\bottomrule
+\end{tabular}
+
+\caption{Security and task utility on all four AgentDojo domains under
+the \texttt{tool\_knowledge} attack using
+\texttt{gpt-4o-2024-08-06}. The information flow control policy
+corresponds to FIDES, while the provenance policy is our Datalog policy.
+Each cell reports the mean percentage and standard deviation over
+five independent sweeps. Each sweep contains 97 benign user
+tasks and 949 attacked runs, matched across configurations. Task
+utility is the percentage of benign tasks completed successfully.
+Utility under attack is the percentage of user tasks completed in
+attacked runs. ASR (AgentDojo) is the benchmark's attack success
+rate: the percentage of attacked runs in which the injection achieves
+its objective. ASR (State) scores the same runs by the final
+environment state alone. It leaves out Slack injection task~5, the
+one task AgentDojo scores from the conversation, which counts an
+attempted call as a success even when the reference monitor refused
+it (928 attacked runs per sweep). Higher utility and lower ASR
+indicate better performance.}
+\label{tab:agentdojo}
+\end{table*}
+
+% Supplementary statistics table
+\begin{table*}[t]
+\centering
+\footnotesize
+\begin{tabular}{@{}l r r r r r r@{}}
+\toprule
+\textbf{Arm} & \textbf{Sweeps} & \textbf{Coverage} & \textbf{Mean (s)} & \textbf{Errors} & \textbf{Refusals} & \textbf{Refusal Calls} \\
+\midrule
+N-none & 5 & 5230/5230 & 4.83 & 1 & 0 & 0 \\
+N-tf & 5 & 5230/5230 & 5.05 & 0 & 0 & 0 \\
+P-fides & 5 & 5230/5230 & 5.67 & 0 & 3005 & 4651 \\
+C-w2-norep & 5 & 5230/5230 & 5.03 & 2 & 2134 & 3103 \\
+N-none-rep & 5 & 5230/5230 & 5.93 & 0 & 0 & 0 \\
+N-tf-rep & 5 & 5230/5230 & 6.40 & 0 & 0 & 0 \\
+P-fides-rep & 5 & 5230/5230 & 10.18 & 0 & 3032 & 15188 \\
+C-w2 & 5 & 5230/5230 & 7.70 & 0 & 1726 & 4252 \\
+\bottomrule
+\end{tabular}
+\caption{Supplementary statistics: runtime coverage, mean duration, error counts, and policy refusals. Cost data is not recorded in run results.}
+\label{tab:agentdojo-supp}
+\end{table*}

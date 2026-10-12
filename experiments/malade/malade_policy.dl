@@ -1,0 +1,128 @@
+/* MALADE Policy (Soufflé with dot notation sugar) */
+/* Preprocessed by sugar.py before Soufflé compilation */
+
+/* ── Additional Relations ─────────────────────────────────────────── */
+
+.decl CurrentDependsSameAgent(source_id: symbol)
+.decl ApprovesFDAUsage(id: symbol)
+.output CurrentDependsSameAgent
+.output ApprovesFDAUsage
+
+// Same-agent backward reachability from Current — a per-policy
+// analogue of common_policy.dl's ``CurrentDepends`` that scopes
+// the recursion to messages sharing the current agent identity.
+// Used only by the ``api.fda.gov`` authorization rule below;
+// every other action class (OpenAI requests, tool calls,
+// non-policy HTTP, send attempts) skips the recursion entirely.
+//
+// ``CurrentDependsSameAgentPolicyRelevant`` mirrors the gating
+// pattern ``CurrentDepends`` uses in common_policy.dl: when no
+// rule sets it for the current request, the recursion produces
+// no tuples and the FDA authorization rule short-circuits to
+// "no approval found" (which then trips ``DenyUnauthorized``
+// for FDA, exactly the existing semantics for unauthenticated
+// FDA requests). Local to malade because same-agent scoping is
+// MALADE-specific; if a second policy needs the same shape we'll
+// lift it.
+.decl CurrentDependsSameAgentPolicyRelevant()
+.output CurrentDependsSameAgentPolicyRelevant
+CurrentDependsSameAgentPolicyRelevant() :-
+    Actions(_, a),
+    QueriesHost(a, "api.fda.gov").
+
+// Checks same-agent inline instead of materializing O(N^2) SameAgent pairs.
+CurrentDependsSameAgent(src) :-
+    CurrentDependsSameAgentPolicyRelevant(),
+    Current(id), Edge(src, id),
+    SentMessage(id, mid), SentMessage(src, msrc),
+    mid.agent = msrc.agent.
+CurrentDependsSameAgent(src) :-
+    CurrentDependsSameAgent(mid_id), Edge(src, mid_id),
+    SentMessage(mid_id, mmid), SentMessage(src, msrc),
+    mmid.agent = msrc.agent.
+
+/* ── FDA Registration Approval ────────────────────────────────────── */
+
+// Approve FDA usage when a register_fda_usage result starts with "confirmed"
+ApprovesFDAUsage(response_id) :-
+    ToolResult(response_id, "register_fda_usage", _),
+    SentMessage(response_id, msg),
+    @str_starts_with(@str_to_lower(msg.contents), "confirmed") = 1.
+
+
+/* ── Authorization Rules ──────────────────────────────────────────── */
+
+// @deny_message: OpenAI API access requires openai-access role
+// @suggestion: Request the openai-access role from an administrator
+// @url_pattern: api.openai.com
+IsAuthorized(idx) :-
+    Actions(idx, a),
+    QueriesHost(a, "api.openai.com"),
+    HasRole("openai-access").
+
+// @deny_message: FDA API access requires approved registration
+// @suggestion: Call the `register_fda_usage` tool repeatedly until you acquire FDA API authorization
+// @url_pattern: api.fda.gov
+IsAuthorized(idx) :-
+    Actions(idx, a),
+    QueriesHost(a, "api.fda.gov"),
+    Current(id),
+    CurrentDependsSameAgent(reg_response_id),
+    ApprovesFDAUsage(reg_response_id),
+    SentMessage(id, msg),
+    msg.agent = "FDAHandler",
+    HasRole("fda-access").
+
+// Context-free NDC drug-category discovery: permit querying the NDC
+// endpoint when no prior message context exists (driver/bootstrap
+// exception). Scoped to exactly /drug/ndc.json (with optional query
+// string) so other FDA endpoints still require FDAHandler approval.
+// match() with [/] avoids the preprocessor treating :// as a comment.
+IsAuthorized(idx) :-
+    Actions(idx, a),
+    a = $HTTPRequest(url, _, _),
+    match("https:[/][/]api[.]fda[.]gov/drug/ndc[.]json([?].*)?", url),
+    !Current(_),
+    HasRole("fda-access").
+
+
+/* ── Tool Call Authorization ──────────────────────────────────────── */
+
+// Tool calls: authorized by default
+IsAuthorized(idx) :- Actions(idx, a), IsToolCall(a).
+
+
+/* ── Transform Rules ──────────────────────────────────────────────── */
+
+// OpenAI key injection for all authorized OpenAI requests
+ApplyTransform(idx, "inject_openai_key") :-
+    Actions(idx, a),
+    QueriesHost(a, "api.openai.com"),
+    Authorized(idx).
+
+// FDA key injection for authorized FDA requests
+ApplyTransform(idx, "inject_fda_key") :-
+    Actions(idx, a),
+    QueriesHost(a, "api.fda.gov"),
+    Authorized(idx).
+
+
+/* ── Denial Behavior Rules ────────────────────────────────────────── */
+
+// FDA API: deny if not authorized (strict access control)
+DenyUnauthorized(idx) :- Actions(idx, a), QueriesHost(a, "api.fda.gov").
+
+// OpenAI API: passthrough if not authorized (soft fail)
+AllowPassthrough(idx) :- Actions(idx, a), QueriesHost(a, "api.openai.com").
+
+// Other APIs: passthrough without transforms (not policy-controlled)
+AllowPassthrough(idx) :-
+    Actions(idx, a),
+    a = $HTTPRequest(url, _, _),
+    @url_host(url) != "api.openai.com",
+    @url_host(url) != "api.fda.gov".
+
+// Non-HTTP actions: passthrough
+AllowPassthrough(idx) :-
+    Actions(idx, a),
+    (a = $CallTool(_, _) ; a = $SendAttempt(_)).
